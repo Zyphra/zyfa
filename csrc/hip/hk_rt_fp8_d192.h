@@ -1,8 +1,8 @@
 #pragma once
 // FP8 fat 32x32x64 tiles for HK-schedule D=192 / Dv=128. KN=64 (d128 HK is KN=128;
 // 4 score tiles + 3 Q chunks spill). CPR=6; nk1 P is (P0+32)%6.
-// V/O stay 128-wide. Do not fold into hk_rt_fp8.h.
-#include "hk_rt_fp8.h"
+// V/O stay 128-wide. Do not fold into hk_rt_fp8_d128.h.
+#include "hk_rt_fp8_d128.h"
 
 namespace hk8_192 {
 

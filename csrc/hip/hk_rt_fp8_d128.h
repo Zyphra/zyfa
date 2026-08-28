@@ -1,5 +1,5 @@
 #pragma once
-// FP8 fat 32x32x64 tiles for HK-schedule research kernel. KN=128.
+// FP8 fat 32x32x64 tiles for HK-schedule D=128. KN=128.
 // Stream K/V from LDS (no kv register tile) to keep VGPR/spills down.
 #include "hk_rt.h"
 #include <hip/hip_fp8.h>

@@ -3,7 +3,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
-#include "hk_rt_bf16.h"
+#include "hk_rt_bf16_d128.h"
 #include "xcd_map.h"
 
 namespace fmha32_hkbf16 {
