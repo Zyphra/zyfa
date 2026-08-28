@@ -3,10 +3,10 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
-#include "hk_rt_bf16_d192.h"
+#include "rt_bf16_d192.h"
 #include "xcd_map.h"
 
-namespace fmha32_hkbf16_d192 {
+namespace fmha_bf16_d192 {
 
 using namespace hk;
 using namespace hk192;
@@ -134,11 +134,11 @@ static void run(const bf16 *Q, const bf16 *K, const bf16 *V, float *O, float *Ls
     attend_ker<<<nq_pairs * B * Hq, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
 }
 
-std::vector<torch::Tensor> forward_hkbf16_d192(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale,
+std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale,
                                                bool causal, bool return_lse) {
-    TORCH_CHECK(causal, "fmha32_hkbf16_d192 is causal-only");
+    TORCH_CHECK(causal, "fmha_bf16_d192 is causal-only");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
-    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "fmha32_hkbf16_d192 needs bfloat16");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "fmha_bf16_d192 needs bfloat16");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q,k,v must be [B,H,S,D]");
     q = q.contiguous();
     k = k.contiguous();
@@ -162,4 +162,4 @@ std::vector<torch::Tensor> forward_hkbf16_d192(torch::Tensor q, torch::Tensor k,
     return {O};
 }
 
-} // namespace fmha32_hkbf16_d192
+} // namespace fmha_bf16_d192

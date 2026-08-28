@@ -2,8 +2,8 @@
 // BF16 32x32x16 tiles for HK-schedule D=192 / Dv=128. KN=64.
 // 12 Q D-chunks, 3 K prefetch passes, K swizzle CPR=24.
 // nk1 P is (P0+32)%24 — not a fixed ds_read imm offset.
-// V/O stay 128-wide (mma_pv_sl / store_o). Do not fold into hk_rt_bf16_d128.h.
-#include "hk_rt.h"
+// V/O stay 128-wide (mma_pv_sl / store_o). Do not fold into rt_bf16_d128.h.
+#include "rt.h"
 
 namespace hk192 {
 
