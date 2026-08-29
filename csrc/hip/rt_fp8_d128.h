@@ -311,23 +311,6 @@ __device__ __forceinline__ i32x8 pack_p(const fx16 &lo, const fx16 &hi) {
     return pa;
 }
 
-__device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
-    if (!__any(corr != 1.f))
-        return;
-    const int gb = laneid() >> 5;
-    float ct[16];
-#pragma unroll
-    for (int r = 0; r < 16; ++r)
-        ct[r] = __shfl(corr, fmha_qoff(r, gb));
-#pragma unroll
-    for (int r = 0; r < 16; ++r) {
-        o.a[r] *= ct[r];
-        o.b[r] *= ct[r];
-        o.c[r] *= ct[r];
-        o.d[r] *= ct[r];
-    }
-}
-
 __device__ __forceinline__ void store_o_tile(float *O, int q_base, int M, const fx16 &t, int j, const float *inv) {
     const int c32 = laneid() & 31, gb = laneid() >> 5;
 #pragma unroll

@@ -29,6 +29,40 @@ __device__ __forceinline__ const unsigned char *kv_tile_ptr(const unsigned char 
     return base + (size_t)tile * KV_BLOCK * D;
 }
 
+__device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
+    if (!__any(corr != 1.f))
+        return;
+    const int gb = laneid() >> 5;
+    float ct[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r)
+        ct[r] = __shfl(corr, fmha_qoff(r, gb));
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        o.a[r] *= ct[r];
+        o.b[r] *= ct[r];
+        o.c[r] *= ct[r];
+        o.d[r] *= ct[r];
+    }
+}
+
+__device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase, float scale, float &m_, float &l_) {
+    const float mx = col_max4_sc(s, scale);
+    const float mnew = fmaxf(m_, mx);
+    const float corr = exp2f(m_ - mnew);
+    rescale_o(o, corr);
+    exp2_sc(s.a, scale, mnew);
+    exp2_sc(s.b, scale, mnew);
+    __builtin_amdgcn_s_setprio(1);
+    mma_pv_lds(o, vbase, pack_p(s.a, s.b), 0);
+    exp2_sc(s.c, scale, mnew);
+    exp2_sc(s.d, scale, mnew);
+    mma_pv_lds(o, vbase, pack_p(s.c, s.d), 2);
+    __builtin_amdgcn_s_setprio(0);
+    l_ = l_ * corr + col_sum4(s);
+    m_ = mnew;
+}
+
 __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, const unsigned char *K,
                                                     const unsigned char *V, float *O, float *Lse, int M, int N,
                                                     int Hq, int Hkv, float scale, int nxcd) {
@@ -102,20 +136,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s4(att, q_start, kb);
 
-            const float mx = col_max4_sc(att, scale);
-            const float mnew = fmaxf(m_, mx);
-            const float corr = exp2f(m_ - mnew);
-            rescale_o(oR, corr);
-            exp2_sc(att.a, scale, mnew);
-            exp2_sc(att.b, scale, mnew);
-            __builtin_amdgcn_s_setprio(1);
-            mma_pv_lds(oR, vbase, pack_p(att.a, att.b), 0);
-            exp2_sc(att.c, scale, mnew);
-            exp2_sc(att.d, scale, mnew);
-            mma_pv_lds(oR, vbase, pack_p(att.c, att.d), 2);
-            __builtin_amdgcn_s_setprio(0);
-            l_ = l_ * corr + col_sum4(att);
-            m_ = mnew;
+            softmax_pv(oR, att, vbase, scale, m_, l_);
             wg_bar();
         }
 

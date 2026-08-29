@@ -29,6 +29,37 @@ __device__ __forceinline__ const bf16 *kv_tile_ptr(const bf16 *base, int tile, i
     return base + (size_t)tile * KV_BLOCK * dim;
 }
 
+__device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
+    if (!__any(corr != 1.f))
+        return;
+    o.a = mulsc(o.a, corr);
+    o.b = mulsc(o.b, corr);
+    o.c = mulsc(o.c, corr);
+    o.d = mulsc(o.d, corr);
+}
+
+__device__ __forceinline__ void softmax_pv(o_tile &o, s_tile &s, const st_v &vsm, float &m_, float &l_) {
+    const float mx = col_max2(s);
+    const float mnew = fmaxf(m_, mx);
+    const float corr = (mnew > m_) ? exp2f(m_ - mnew) : 1.f;
+    rescale_o(o, corr);
+    exp2_m(s.a, mnew);
+    p_tile p;
+    p.a = cvt8(s.a, 0);
+    p.b = cvt8(s.a, 8);
+    __builtin_amdgcn_s_setprio(1);
+    mma_pv_sl<0>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
+    mma_pv_sl<1>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
+    exp2_m(s.b, mnew);
+    p.c = cvt8(s.b, 0);
+    p.d = cvt8(s.b, 8);
+    mma_pv_sl<2>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
+    mma_pv_sl<3>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
+    __builtin_amdgcn_s_setprio(0);
+    l_ = l_ * corr + col_sum2(s);
+    m_ = mnew;
+}
+
 __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K, const bf16 *V, float *O, float *Lse,
                                                     int M, int N, int Hq, int Hkv, float scale, int nxcd) {
     extern __shared__ Smem sm[];
