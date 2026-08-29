@@ -1,7 +1,8 @@
 #pragma once
-// FP8 fat 32x32x64 tiles for HK-schedule D=192 / Dv=128. KN=64 (d128 HK is KN=128;
-// 4 score tiles + 3 Q chunks spill). CPR=6; nk1 P is (P0+32)%6.
-// V/O stay 128-wide. Do not fold into rt_fp8_d128.h.
+// FP8 fat 32x32x64 tiles for HK-schedule D=192 / Dv=128. KN=64.
+// K LDS is stride 256 (16×16B/key) so dest=c*16 for global_load_lds
+// (m0+lane*16) and P is invariant across +32 keys (offset:8192).
+// Global K stays D=192; chunks 12-15 are dummy. V/O stay 128-wide.
 #include "rt_fp8_d128.h"
 
 namespace hk8_192 {
@@ -21,7 +22,7 @@ using hk8::lds_u32;
 using hk8::fmha_qoff;
 using hk8::max3;
 
-constexpr int KN = 64, D = 192, Dv = 128, CPR = D / 32, NKB = 2, NDVB = 4;
+constexpr int KN = 64, D = 192, Dv = 128, CPR = 8, KSTRIDE = 256, NKB = 2, NDVB = 4;
 
 struct q8_tile192 {
     i32x8 d0, d1, d2;
@@ -39,7 +40,7 @@ __device__ __forceinline__ void pin_s2(s2_tile &t) { asm volatile("" : "+v"(t.a)
                                      (__attribute__((address_space(3))) void *)(l), 16, 0, 0)
 
 struct alignas(16) st_k {
-    unsigned char data[KN * D];
+    unsigned char data[KN * KSTRIDE];
 };
 struct alignas(16) st_v {
     unsigned char data[KN * Dv];
@@ -48,13 +49,11 @@ struct alignas(16) st_v {
 template <int Pass>
 __device__ __forceinline__ void prefetch_k_pass(st_k &sm, const unsigned char *g) {
     const int c = (int)threadIdx.x + Pass * 512;
-    if (c >= KN * (D / 16))
-        return;
-    const int key = c / (D / 16);
-    const int off16 = (c % (D / 16)) * 16;
-    const int P = off16 / 32, r = off16 % 32;
-    const int L = ((P - key) % CPR + CPR) % CPR;
-    HK8_192_GLD16(g + (size_t)key * D + L * 32 + r, sm.data + key * D + P * 32 + r);
+    const int key = c / 16, chunk = c & 15;
+    const int P = chunk >> 1, r = (chunk & 1) * 16;
+    const int L = (P - key) & (CPR - 1);
+    const int Ls = (L < 6) ? L : 0;
+    HK8_192_GLD16(g + (size_t)key * D + Ls * 32 + r, sm.data + c * 16);
 }
 
 __device__ __forceinline__ void prefetch_v(st_v &sm, const unsigned char *g) {
@@ -78,23 +77,22 @@ __device__ __forceinline__ void load_q8(q8_tile192 &dst, const unsigned char *g)
     dst.d2 = load32(g + (size_t)c32 * D + 2 * 64 + gb * 32);
 }
 
-__device__ __forceinline__ uint32_t k_off(uint32_t kbase, int ds, int nk) {
+__device__ __forceinline__ uint32_t k_off(uint32_t kbase, int ds) {
     const int c32 = laneid() & 31, gb = laneid() >> 5;
-    const int ky = nk * 32 + c32;
-    const int P = ((ds * 2 + gb) + ky) % CPR;
-    return kbase + (uint32_t)(ky * D + P * 32);
+    const int P = ((ds * 2 + gb) + c32) & (CPR - 1);
+    return kbase + (uint32_t)(c32 * KSTRIDE + P * 32);
 }
 
 template <bool Acc>
-__device__ __forceinline__ void mma_qk_pair(s2_tile &s, uint32_t off0, uint32_t off1, i32x8 qb) {
+__device__ __forceinline__ void mma_qk_pair(s2_tile &s, uint32_t off, i32x8 qb) {
     i32x4 a0, a1, b0, b1;
-    asm volatile("ds_read_b128 %[a0], %[a]\n\t"
-                 "ds_read_b128 %[a1], %[a] offset:16\n\t"
-                 "ds_read_b128 %[b0], %[b]\n\t"
-                 "ds_read_b128 %[b1], %[b] offset:16\n\t"
+    asm volatile("ds_read_b128 %[a0], %[addr]\n\t"
+                 "ds_read_b128 %[a1], %[addr] offset:16\n\t"
+                 "ds_read_b128 %[b0], %[addr] offset:8192\n\t"
+                 "ds_read_b128 %[b1], %[addr] offset:8208\n\t"
                  "s_waitcnt lgkmcnt(2)"
                  : [a0] "=&v"(a0), [a1] "=&v"(a1), [b0] "=&v"(b0), [b1] "=&v"(b1)
-                 : [a] "v"(off0), [b] "v"(off1));
+                 : [addr] "v"(off));
     if constexpr (Acc)
         s.a = kh_mma(pack8(a0, a1), qb, s.a);
     else

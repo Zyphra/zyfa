@@ -123,11 +123,11 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             const unsigned char *gVn = kv_tile_ptr(Vh, kb_n, Dv);
             s2_tile att;
             prefetch_k_pass<0>(s.k[nx], gKn);
-            mma_qk_pair<false>(att, k_off(kbase, 0, 0), k_off(kbase, 0, 1), qT.d0);
+            mma_qk_pair<false>(att, k_off(kbase, 0), qT.d0);
             prefetch_k_pass<1>(s.k[nx], gKn);
-            mma_qk_pair<true>(att, k_off(kbase, 1, 0), k_off(kbase, 1, 1), qT.d1);
+            mma_qk_pair<true>(att, k_off(kbase, 1), qT.d1);
             prefetch_v(s.v[nx], gVn);
-            mma_qk_pair<true>(att, k_off(kbase, 2, 0), k_off(kbase, 2, 1), qT.d2);
+            mma_qk_pair<true>(att, k_off(kbase, 2), qT.d2);
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s2(att, q_start, kb);
 
@@ -149,7 +149,7 @@ static void run(const unsigned char *Q, const unsigned char *K, const unsigned c
     const int nq_pairs = (numQ + 1) / 2;
     const int nxcd = fmha_num_xcds();
     const size_t smem = sizeof(Smem);
-    hipFuncSetAttribute((const void *)attend_ker, hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    hipFuncSetAttribute((const void *)attend_ker, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
     attend_ker<<<nq_pairs * B * Hq, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
 }
 
