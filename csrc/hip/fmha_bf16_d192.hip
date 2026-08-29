@@ -125,22 +125,23 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
             zero_s(att);
             pin_s(att);
             prefetch_k_pass<0>(s.k[nx], gKn);
-            mma_qk_pair(att, k_off(kbase, 0, 0), k_off(kbase, 0, 1), qT.d0);
-            mma_qk_pair(att, k_off(kbase, 1, 0), k_off(kbase, 1, 1), qT.d1);
-            mma_qk_pair(att, k_off(kbase, 2, 0), k_off(kbase, 2, 1), qT.d2);
-            mma_qk_pair(att, k_off(kbase, 3, 0), k_off(kbase, 3, 1), qT.d3);
+            mma_qk_pair(att, k_off(kbase, 0), qT.d0);
+            mma_qk_pair(att, k_off(kbase, 1), qT.d1);
+            mma_qk_pair(att, k_off(kbase, 2), qT.d2);
+            mma_qk_pair(att, k_off(kbase, 3), qT.d3);
             prefetch_k_pass<1>(s.k[nx], gKn);
-            mma_qk_pair(att, k_off(kbase, 4, 0), k_off(kbase, 4, 1), qT.d4);
-            mma_qk_pair(att, k_off(kbase, 5, 0), k_off(kbase, 5, 1), qT.d5);
-            mma_qk_pair(att, k_off(kbase, 6, 0), k_off(kbase, 6, 1), qT.d6);
-            mma_qk_pair(att, k_off(kbase, 7, 0), k_off(kbase, 7, 1), qT.d7);
+            mma_qk_pair(att, k_off(kbase, 4), qT.d4);
+            mma_qk_pair(att, k_off(kbase, 5), qT.d5);
+            mma_qk_pair(att, k_off(kbase, 6), qT.d6);
+            mma_qk_pair(att, k_off(kbase, 7), qT.d7);
             prefetch_k_pass<2>(s.k[nx], gKn);
-            mma_qk_pair(att, k_off(kbase, 8, 0), k_off(kbase, 8, 1), qT.d8);
+            mma_qk_pair(att, k_off(kbase, 8), qT.d8);
+            prefetch_k_pass<3>(s.k[nx], gKn);
             prefetch_v_pass<0>(s.v[nx], gVn);
-            mma_qk_pair(att, k_off(kbase, 9, 0), k_off(kbase, 9, 1), qT.d9);
-            mma_qk_pair(att, k_off(kbase, 10, 0), k_off(kbase, 10, 1), qT.d10);
+            mma_qk_pair(att, k_off(kbase, 9), qT.d9);
+            mma_qk_pair(att, k_off(kbase, 10), qT.d10);
             prefetch_v_pass<1>(s.v[nx], gVn);
-            mma_qk_pair(att, k_off(kbase, 11, 0), k_off(kbase, 11, 1), qT.d11);
+            mma_qk_pair(att, k_off(kbase, 11), qT.d11);
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s2(att, q_start, kb);
             softmax_pv(oR, att, s.v[cur], m_, l_);
@@ -161,7 +162,7 @@ static void run(const bf16 *Q, const bf16 *K, const bf16 *V, float *O, float *Ls
     const int nq_pairs = (numQ + 1) / 2;
     const int nxcd = fmha_num_xcds();
     const size_t smem = sizeof(Smem);
-    hipFuncSetAttribute((const void *)attend_ker, hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    hipFuncSetAttribute((const void *)attend_ker, hipFuncAttributeMaxDynamicSharedMemorySize, 131072);
     attend_ker<<<nq_pairs * B * Hq, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
 }
 

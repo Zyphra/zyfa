@@ -1,8 +1,8 @@
 #pragma once
 // BF16 32x32x16 tiles for HK-schedule D=192 / Dv=128. KN=64.
-// 12 Q D-chunks, 3 K prefetch passes, K swizzle CPR=24.
-// nk1 P is (P0+32)%24 — not a fixed ds_read imm offset.
-// V/O stay 128-wide (mma_pv_sl / store_o). Do not fold into rt_bf16_d128.h.
+// K LDS is stride 512 B (32×16B/key) so dest=c*16 for global_load_lds
+// and P is invariant across +32 keys (offset:16384). Global K stays D=192;
+// pairs 24-31 are dummy. V/O stay 128-wide.
 #include "rt.h"
 
 namespace hk192 {
@@ -11,7 +11,7 @@ using namespace hk;
 
 typedef float f2 __attribute__((ext_vector_type(2)));
 
-constexpr int KN = 64, D = 192, Dv = 128, CPR = D / 8;
+constexpr int KN = 64, D = 192, Dv = 128, CPR = 32, KSTRIDE_BF16 = 256;
 
 struct q_tile192 {
     v8b d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11;
@@ -33,7 +33,7 @@ __device__ __forceinline__ float max3(float a, float b, float c) {
                                      (__attribute__((address_space(3))) void *)(l), 16, 0, 0)
 
 struct alignas(16) st_k {
-    bf16 data[KN * D];
+    bf16 data[KN * KSTRIDE_BF16];
 };
 struct alignas(16) st_v {
     bf16 data[KN * Dv];
@@ -42,10 +42,10 @@ struct alignas(16) st_v {
 template <int Pass>
 __device__ __forceinline__ void prefetch_k_pass(st_k &sm, const bf16 *g) {
     const int c = (int)threadIdx.x + Pass * 512;
-    const int key = c / CPR;
-    const int P = c % CPR;
-    const int L = ((P - key) % CPR + CPR) % CPR;
-    HK192_GLD16(g + (size_t)key * D + L * 8, sm.data + c * 8);
+    const int key = c / CPR, P = c % CPR;
+    const int L = (P - key) & (CPR - 1);
+    const int Ls = (L < 24) ? L : 0;
+    HK192_GLD16(g + (size_t)key * D + Ls * 8, sm.data + c * 8);
 }
 
 template <int Pass>
@@ -61,6 +61,7 @@ __device__ __forceinline__ void prefetch_k(st_k &sm, const bf16 *g) {
     prefetch_k_pass<0>(sm, g);
     prefetch_k_pass<1>(sm, g);
     prefetch_k_pass<2>(sm, g);
+    prefetch_k_pass<3>(sm, g);
 }
 
 __device__ __forceinline__ void prefetch_v(st_v &sm, const bf16 *g) {
@@ -106,21 +107,19 @@ __device__ __forceinline__ uint32_t lds_u32(const bf16 *p) {
     return off;
 }
 
-// CPR=24 is not a divisor of 32, so nk1 cannot reuse nk0's P (unlike d128).
-__device__ __forceinline__ uint32_t k_off(uint32_t kbase, int ds, int nk) {
+__device__ __forceinline__ uint32_t k_off(uint32_t kbase, int ds) {
     const int c32 = laneid() & 31, gb = laneid() >> 5;
-    const int ky = nk * 32 + c32;
-    const int P = ((ds * 2 + gb) + ky) % CPR;
-    return kbase + (uint32_t)(ky * (D * 2) + P * 16);
+    const int P = ((ds * 2 + gb) + c32) & (CPR - 1);
+    return kbase + (uint32_t)(c32 * (KSTRIDE_BF16 * 2) + P * 16);
 }
 
-__device__ __forceinline__ void mma_qk_pair(s_tile &s, uint32_t off0, uint32_t off1, v8b qb) {
+__device__ __forceinline__ void mma_qk_pair(s_tile &s, uint32_t off, v8b qb) {
     v8b a, b;
-    asm volatile("ds_read_b128 %[a], %[a0]\n\t"
-                 "ds_read_b128 %[b], %[a1]\n\t"
+    asm volatile("ds_read_b128 %[a], %[addr]\n\t"
+                 "ds_read_b128 %[b], %[addr] offset:16384\n\t"
                  "s_waitcnt lgkmcnt(1)"
                  : [a] "=&v"(a), [b] "=&v"(b)
-                 : [a0] "v"(off0), [a1] "v"(off1));
+                 : [addr] "v"(off));
     s.a = mfma16(a, qb, s.a);
     asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(b));
     s.b = mfma16(b, qb, s.b);
