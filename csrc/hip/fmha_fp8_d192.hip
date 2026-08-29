@@ -1,6 +1,5 @@
 // HK GQA causal + XCD pair, fp8 fat 32x32x64, KN=64, streamed LDS K/V.
-// D=192 / Dv=128 / 8-wave / causal only.
-// V issue under last QK; col_sum under late PV.
+// Research kernel. D=192 / Dv=128 / 8-wave / causal only. Do not fold into fmha_fp8.hip.
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
@@ -11,12 +10,6 @@ namespace fmha_fp8_d192 {
 
 using namespace hk;
 using namespace hk8_192;
-using hk8::i32x8;
-using hk8::v2i32;
-using hk8::kh_mma;
-using hk8::pack_p;
-using hk8::pack_v2x4;
-using hk8::ds_tr8;
 
 constexpr int Q_BLOCK = 32;
 constexpr int KV_BLOCK = 64;
@@ -30,10 +23,6 @@ __device__ __forceinline__ __attribute__((convergent)) void wg_bar() { __syncthr
 struct alignas(16) Smem {
     st_k k[2];
     st_v v[2];
-};
-
-struct v8 {
-    v2i32 a0, a1, a2, a3, b0, b1, b2, b3;
 };
 
 __device__ __forceinline__ const unsigned char *kv_tile_ptr(const unsigned char *base, int tile, int dim) {
@@ -57,21 +46,7 @@ __device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
     }
 }
 
-__device__ __forceinline__ void issue_v8(uint32_t vbase, v8 &v) {
-    v.a0 = ds_tr8(v_tr8_off(vbase, 0, 0, 0));
-    v.a1 = ds_tr8(v_tr8_off(vbase, 0, 0, 1));
-    v.a2 = ds_tr8(v_tr8_off(vbase, 0, 1, 0));
-    v.a3 = ds_tr8(v_tr8_off(vbase, 0, 1, 1));
-    v.b0 = ds_tr8(v_tr8_off(vbase, 1, 0, 0));
-    v.b1 = ds_tr8(v_tr8_off(vbase, 1, 0, 1));
-    v.b2 = ds_tr8(v_tr8_off(vbase, 1, 1, 0));
-    v.b3 = ds_tr8(v_tr8_off(vbase, 1, 1, 1));
-    asm volatile("" : "+v"(v.a0), "+v"(v.a1), "+v"(v.a2), "+v"(v.a3), "+v"(v.b0), "+v"(v.b1), "+v"(v.b2),
-                      "+v"(v.b3)::"memory");
-}
-
-__device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, v8 &v, uint32_t vbase, float scale, float &m_,
-                                          float &l_) {
+__device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase, float scale, float &m_, float &l_) {
     const float mx = col_max2_sc(s, scale);
     const float mnew = fmaxf(m_, mx);
     const float corr = (mnew > m_) ? exp2f(m_ - mnew) : 1.f;
@@ -79,25 +54,9 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, v8 &v, uint32_
     hk8::exp2_sc(s.a, scale, mnew);
     __builtin_amdgcn_s_setprio(1);
     hk8::exp2_sc(s.b, scale, mnew);
-    const i32x8 ps = pack_p(s.a, s.b);
-    const float ladd = col_sum2(s);
-
-    asm volatile("s_waitcnt lgkmcnt(4)"
-                 : "+v"(v.a0), "+v"(v.a1), "+v"(v.a2), "+v"(v.a3), "+v"(v.b0), "+v"(v.b1), "+v"(v.b2), "+v"(v.b3));
-    o.a = kh_mma(ps, pack_v2x4(v.a0, v.a1, v.a2, v.a3), o.a);
-    v2i32 c0 = ds_tr8(v_tr8_off(vbase, 2, 0, 0)), c1 = ds_tr8(v_tr8_off(vbase, 2, 0, 1));
-    v2i32 c2 = ds_tr8(v_tr8_off(vbase, 2, 1, 0)), c3 = ds_tr8(v_tr8_off(vbase, 2, 1, 1));
-    asm volatile("s_waitcnt lgkmcnt(4)"
-                 : "+v"(v.b0), "+v"(v.b1), "+v"(v.b2), "+v"(v.b3), "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3));
-    o.b = kh_mma(ps, pack_v2x4(v.b0, v.b1, v.b2, v.b3), o.b);
-    v2i32 d0 = ds_tr8(v_tr8_off(vbase, 3, 0, 0)), d1 = ds_tr8(v_tr8_off(vbase, 3, 0, 1));
-    v2i32 d2 = ds_tr8(v_tr8_off(vbase, 3, 1, 0)), d3 = ds_tr8(v_tr8_off(vbase, 3, 1, 1));
-    asm volatile("s_waitcnt lgkmcnt(4)" : "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3), "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3));
-    o.c = kh_mma(ps, pack_v2x4(c0, c1, c2, c3), o.c);
-    asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3));
-    o.d = kh_mma(ps, pack_v2x4(d0, d1, d2, d3), o.d);
+    mma_pv_lds(o, vbase, pack_p(s.a, s.b));
     __builtin_amdgcn_s_setprio(0);
-    l_ = l_ * corr + ladd;
+    l_ = l_ * corr + col_sum2(s);
     m_ = mnew;
 }
 
@@ -163,18 +122,16 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             const unsigned char *gKn = kv_tile_ptr(Kh, kb_n, D);
             const unsigned char *gVn = kv_tile_ptr(Vh, kb_n, Dv);
             s2_tile att;
-            v8 vv;
             prefetch_k_pass<0>(s.k[nx], gKn);
             mma_qk_pair<false>(att, k_off(kbase, 0, 0), k_off(kbase, 0, 1), qT.d0);
             prefetch_k_pass<1>(s.k[nx], gKn);
             mma_qk_pair<true>(att, k_off(kbase, 1, 0), k_off(kbase, 1, 1), qT.d1);
             prefetch_v(s.v[nx], gVn);
-            issue_v8(vbase, vv);
             mma_qk_pair<true>(att, k_off(kbase, 2, 0), k_off(kbase, 2, 1), qT.d2);
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s2(att, q_start, kb);
-            pin_s2(att);
-            softmax_pv(oR, att, vv, vbase, scale, m_, l_);
+
+            softmax_pv(oR, att, vbase, scale, m_, l_);
             wg_bar();
         }
 
