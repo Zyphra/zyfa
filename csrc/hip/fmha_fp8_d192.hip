@@ -50,7 +50,9 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase
     const float mx = col_max2_sc(s, scale);
     const float mnew = fmaxf(m_, mx);
     const float corr = (mnew > m_) ? exp2f(m_ - mnew) : 1.f;
-    rescale_o(o, corr);
+    // o is known-zero before the first KV tile.
+    if (__builtin_expect(m_ != neg_inf(), 1))
+        rescale_o(o, corr);
     hk8::exp2_sc(s.a, scale, mnew);
     __builtin_amdgcn_s_setprio(1);
     hk8::exp2_sc(s.b, scale, mnew);

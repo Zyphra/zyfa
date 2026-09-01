@@ -42,7 +42,10 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s_tile &s, const st16 &vsm
     const float mx = col_max2(s);
     const float mnew = fmaxf(m_, mx);
     const float corr = (mnew > m_) ? exp2f(m_ - mnew) : 1.f;
-    rescale_o(o, corr);
+    // o is known-zero before the first KV tile; do not broadcast corr=0
+    // and multiply the entire output accumulator by zero.
+    if (__builtin_expect(m_ != neg_inf(), 1))
+        rescale_o(o, corr);
     exp2_m(s.a, mnew);
     p_tile p;
     p.a = cvt8(s.a, 0);
