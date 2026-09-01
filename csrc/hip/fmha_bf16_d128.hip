@@ -1,5 +1,5 @@
 // HK GQA causal + XCD pair, bf16 32x32x16, KN=64, streamed LDS K/V.
-// Research kernel. D=Dv=128 / 8-wave / causal only. Do not fold into fmha32.hip.
+// One bar per tile (next iter's bar covers V lifetime). Research kernel. D=Dv=128 / 8-wave / causal only. Do not fold into fmha32.hip.
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
@@ -114,7 +114,10 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
 
         for (int kb = 0; kb < max_num_tiles; ++kb) {
             const int cur = kb & 1, nx = cur ^ 1;
-            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            if (kb == 0)
+                asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            else
+                asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
             wg_bar();
             uint32_t kbase = lds_u32(s.k[cur].data);
             asm volatile("" : "+v"(kbase));
@@ -139,7 +142,6 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s2(att, q_start, kb);
             softmax_pv(oR, att, s.v[cur], m_, l_);
-            wg_bar();
         }
 
         store_o(Oh, q_start, M, oR, l_);
