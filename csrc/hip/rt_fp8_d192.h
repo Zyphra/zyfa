@@ -143,11 +143,13 @@ __device__ __forceinline__ void mask_s2(s2_tile &s, int q_start, int kb) {
 }
 
 __device__ __forceinline__ float col_max2_sc(const s2_tile &s, float scale) {
+    // scale is positive for attention. Reduce raw QK first and apply
+    // scale once after the cross-half max instead of 32 times per lane.
     float mx = neg_inf();
 #pragma unroll
     for (int r = 0; r < 16; ++r)
-        mx = max3(s.a[r] * scale, s.b[r] * scale, mx);
-    return fmaxf(mx, __shfl_xor(mx, 32));
+        mx = max3(s.a[r], s.b[r], mx);
+    return fmaxf(mx, __shfl_xor(mx, 32)) * scale;
 }
 
 __device__ __forceinline__ float col_sum2(const s2_tile &s) {

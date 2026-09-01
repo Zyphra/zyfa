@@ -251,13 +251,14 @@ __device__ __forceinline__ void mask_s4(s4_tile &s, int q_start, int kb) {
 }
 
 __device__ __forceinline__ float col_max4_sc(const s4_tile &s, float scale) {
+    // scale is positive for attention. max(scale*x) == scale*max(x),
+    // so keep the reduction in raw QK space and pay one multiply after
+    // the cross-half reduction instead of 64 multiplies per lane.
     float mx = neg_inf();
 #pragma unroll
-    for (int r = 0; r < 16; ++r) {
-        const float sa = s.a[r] * scale, sb = s.b[r] * scale, sc = s.c[r] * scale, sd = s.d[r] * scale;
-        mx = max3(max3(sa, sb, sc), sd, mx);
-    }
-    return fmaxf(mx, __shfl_xor(mx, 32));
+    for (int r = 0; r < 16; ++r)
+        mx = max3(max3(s.a[r], s.b[r], s.c[r]), s.d[r], mx);
+    return fmaxf(mx, __shfl_xor(mx, 32)) * scale;
 }
 
 // Packed mul+add, not fma: fmaf(-inf, scale, -mnew) nans when mnew is -inf.
