@@ -62,6 +62,7 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase
     m_ = mnew;
 }
 
+template <bool PairHeads>
 __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, const unsigned char *K,
                                                     const unsigned char *V, float *O, float *Lse, int M, int N, int Hq,
                                                     int Hkv, float scale, int nxcd) {
@@ -70,16 +71,35 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
 
     constexpr int D = 192, Dv = 128;
     const int GROUP = Hq / Hkv;
-    const int numQ = (M / Q_BLOCK + NW - 1) / NW;
+    constexpr int QW = PairHeads ? (NW / 2) : NW;
+    const int numQ = (M / Q_BLOCK + QW - 1) / QW;
     const int nq_pairs = (numQ + 1) / 2;
-    const int n_bh = (int)gridDim.x / nq_pairs;
-    int qx, bh;
-    fmha_xcd_map(nq_pairs, n_bh, nxcd, qx, bh);
+    const int n_head_units = (int)gridDim.x / nq_pairs;
+    int qx, hu;
+    fmha_xcd_map(nq_pairs, n_head_units, nxcd, qx, hu);
 
-    const int batch_idx = bh / Hq;
-    const int h_lin = bh % Hq;
-    const int head_idx = (h_lin % Hkv) * GROUP + (h_lin / Hkv);
-    const int head_kv = head_idx / GROUP;
+    int batch_idx, head_idx, head_kv, qwarp;
+    if constexpr (PairHeads) {
+        // Eight physical waves become two barrier-synchronous 4-wave
+        // Q-head groups. The two heads share one KV head and identical
+        // q positions, so every K/V G->L transfer services both heads.
+        const int pairs_per_kv = GROUP / 2;
+        const int units_per_batch = Hkv * pairs_per_kv;
+        batch_idx = hu / units_per_batch;
+        const int u = hu - batch_idx * units_per_batch;
+        head_kv = u / pairs_per_kv;
+        const int pair = u - head_kv * pairs_per_kv;
+        const int head_slot = warpid() / QW;
+        qwarp = warpid() - head_slot * QW;
+        head_idx = head_kv * GROUP + pair * 2 + head_slot;
+    } else {
+        // Identity Q-head order keeps GROUP consecutive Q heads on one KV
+        // head so fmha_xcd_map locality extends across GQA.
+        batch_idx = hu / Hq;
+        head_idx = hu - batch_idx * Hq;
+        head_kv = head_idx / GROUP;
+        qwarp = warpid();
+    }
 
     const unsigned char *Qh = Q + ((size_t)batch_idx * Hq + head_idx) * M * D;
     const unsigned char *Kh = K + ((size_t)batch_idx * Hkv + head_kv) * N * D;
@@ -94,8 +114,8 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         const int qblk = pp ? q_lo : q_hi;
         if (pp && q_lo == q_hi)
             break;
-        const int tile_idx = qblk * NW + warpid();
-        const int max_tile_idx = qblk * NW + NW - 1;
+        const int tile_idx = qblk * QW + qwarp;
+        const int max_tile_idx = qblk * QW + QW - 1;
         const int max_q_end = (max_tile_idx + 1) * Q_BLOCK;
         int max_num_tiles = (max_q_end + KV_BLOCK - 1) / KV_BLOCK;
         if (max_num_tiles > num_tiles)
@@ -149,12 +169,20 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
 
 static void run(const unsigned char *Q, const unsigned char *K, const unsigned char *V, float *O, float *Lse, int M,
                 int N, int B, int Hq, int Hkv, float scale, hipStream_t stream) {
-    const int numQ = (M / Q_BLOCK + NW - 1) / NW;
+    const int GROUP = Hq / Hkv;
+    const bool pair_heads = GROUP >= 2 && (GROUP & 1) == 0;
+    const int q_waves = pair_heads ? (NW / 2) : NW;
+    const int numQ = (M / Q_BLOCK + q_waves - 1) / q_waves;
     const int nq_pairs = (numQ + 1) / 2;
     const int nxcd = fmha_num_xcds();
     const size_t smem = sizeof(Smem);
-    hipFuncSetAttribute((const void *)attend_ker, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
-    attend_ker<<<nq_pairs * B * Hq, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    if (pair_heads) {
+        hipFuncSetAttribute((const void *)attend_ker<true>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+        attend_ker<true><<<nq_pairs * B * (Hq / 2), NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    } else {
+        hipFuncSetAttribute((const void *)attend_ker<false>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+        attend_ker<false><<<nq_pairs * B * Hq, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    }
 }
 
 std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale,
