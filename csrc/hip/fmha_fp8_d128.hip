@@ -53,10 +53,11 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     // o is known-zero before the first KV tile.
     if (__builtin_expect(m_ != neg_inf(), 1))
         rescale_o(o, corr);
+    pv_v_head vh = preissue_pv_v(vbase, 0);
     exp2_sc(s.a, scale, mnew);
     exp2_sc(s.b, scale, mnew);
     __builtin_amdgcn_s_setprio(1);
-    mma_pv_lds(o, vbase, pack_p(s.a, s.b), 0);
+    mma_pv_lds_preissued(o, vbase, pack_p(s.a, s.b), 0, vh);
     exp2_sc(s.c, scale, mnew);
     exp2_sc(s.d, scale, mnew);
     mma_pv_lds(o, vbase, pack_p(s.c, s.d), 2);
