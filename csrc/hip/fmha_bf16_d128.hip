@@ -1,4 +1,4 @@
-// HK GQA causal + XCD pair, bf16 32x32x16, KN=64, streamed LDS K/V.
+// HK GQA causal + XCD pair, bf16 32x32x16, KN=128, streamed LDS K/V.
 // One bar per tile (next iter's bar covers V lifetime). Research kernel. D=Dv=128 / 8-wave / causal only. Do not fold into fmha32.hip.
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
@@ -12,7 +12,7 @@ using namespace hk;
 using namespace hk16;
 
 constexpr int Q_BLOCK = 32;
-constexpr int KV_BLOCK = 64;
+constexpr int KV_BLOCK = 128;
 constexpr int NW = 8;
 constexpr int NT = 512;
 constexpr float L2E = 1.4426950408889634f;
@@ -38,28 +38,40 @@ __device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
     o.d = mulsc(o.d, corr);
 }
 
-__device__ __forceinline__ void softmax_pv(o_tile &o, s_tile &s, const st16 &vsm, float &m_, float &l_) {
-    const float mx = col_max2(s);
+__device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, const st16 &vsm, float &m_, float &l_) {
+    const float mx = col_max4(s);
     const float mnew = fmaxf(m_, mx);
     const float corr = (mnew > m_) ? exp2f(m_ - mnew) : 1.f;
     // o is known-zero before the first KV tile; do not broadcast corr=0
     // and multiply the entire output accumulator by zero.
     if (__builtin_expect(m_ != neg_inf(), 1))
         rescale_o(o, corr);
-    exp2_m(s.a, mnew);
+    const auto &vlo = *reinterpret_cast<const st<64, 128> *>(&vsm.data[0]);
+    const auto &vhi = *reinterpret_cast<const st<64, 128> *>(&vsm.data[64 * Dv]);
     p_tile p;
+    exp2_m(s.a, mnew);
     p.a = cvt8(s.a, 0);
     p.b = cvt8(s.a, 8);
     __builtin_amdgcn_s_setprio(1);
-    mma_pv_sl<0>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
-    mma_pv_sl<1>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
+    mma_pv_sl<0>(o, vlo, p);
+    mma_pv_sl<1>(o, vlo, p);
     exp2_m(s.b, mnew);
     p.c = cvt8(s.b, 0);
     p.d = cvt8(s.b, 8);
-    mma_pv_sl<2>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
-    mma_pv_sl<3>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
+    mma_pv_sl<2>(o, vlo, p);
+    mma_pv_sl<3>(o, vlo, p);
+    exp2_m(s.c, mnew);
+    p.a = cvt8(s.c, 0);
+    p.b = cvt8(s.c, 8);
+    mma_pv_sl<0>(o, vhi, p);
+    mma_pv_sl<1>(o, vhi, p);
+    exp2_m(s.d, mnew);
+    p.c = cvt8(s.d, 0);
+    p.d = cvt8(s.d, 8);
+    mma_pv_sl<2>(o, vhi, p);
+    mma_pv_sl<3>(o, vhi, p);
     __builtin_amdgcn_s_setprio(0);
-    l_ = l_ * corr + col_sum2(s);
+    l_ = l_ * corr + col_sum4(s);
     m_ = mnew;
 }
 
@@ -127,23 +139,27 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
             const int kb_n = (kb + 1 < max_num_tiles) ? kb + 1 : kb;
             const bf16 *gKn = kv_tile_ptr(Kh, kb_n, D);
             const bf16 *gVn = kv_tile_ptr(Vh, kb_n, D);
-            s_tile att;
-            zero_s(att);
-            pin_s(att);
+            s4_tile att;
+            zero_s4(att);
+            pin_s4(att);
             prefetch_k_pass<0>(s.k[nx], gKn);
-            mma_qk_pair(att, k_off(kbase, 0), qT.d0);
-            mma_qk_pair(att, k_off(kbase, 1), qT.d1);
-            mma_qk_pair(att, k_off(kbase, 2), qT.d2);
-            mma_qk_pair(att, k_off(kbase, 3), qT.d3);
+            mma_qk_quad(att, k_off(kbase, 0), qT.d0);
+            mma_qk_quad(att, k_off(kbase, 1), qT.d1);
             prefetch_k_pass<1>(s.k[nx], gKn);
-            mma_qk_pair(att, k_off(kbase, 4), qT.d4);
+            mma_qk_quad(att, k_off(kbase, 2), qT.d2);
             prefetch_v_pass<0>(s.v[nx], gVn);
-            mma_qk_pair(att, k_off(kbase, 5), qT.d5);
-            mma_qk_pair(att, k_off(kbase, 6), qT.d6);
+            mma_qk_quad(att, k_off(kbase, 3), qT.d3);
+            prefetch_k_pass<2>(s.k[nx], gKn);
+            mma_qk_quad(att, k_off(kbase, 4), qT.d4);
             prefetch_v_pass<1>(s.v[nx], gVn);
-            mma_qk_pair(att, k_off(kbase, 7), qT.d7);
+            mma_qk_quad(att, k_off(kbase, 5), qT.d5);
+            prefetch_k_pass<3>(s.k[nx], gKn);
+            mma_qk_quad(att, k_off(kbase, 6), qT.d6);
+            prefetch_v_pass<2>(s.v[nx], gVn);
+            mma_qk_quad(att, k_off(kbase, 7), qT.d7);
+            prefetch_v_pass<3>(s.v[nx], gVn);
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
-                mask_s2(att, q_start, kb);
+                mask_s4(att, q_start, kb);
             softmax_pv(oR, att, s.v[cur], m_, l_);
         }
 
@@ -176,7 +192,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     v = v.contiguous();
     const int B = q.size(0), Hq = q.size(1), M = q.size(2), D = q.size(3);
     const int Hkv = k.size(1), N = k.size(2), Dv = v.size(3);
-    TORCH_CHECK(D == 128 && Dv == 128 && M % 256 == 0 && N % 64 == 0);
+    TORCH_CHECK(D == 128 && Dv == 128 && M % 256 == 0 && N % 128 == 0);
     TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && v.size(1) == Hkv && v.size(2) == N);
     auto O = torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kFloat));
     torch::Tensor Lse;
