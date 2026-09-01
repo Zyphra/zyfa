@@ -261,15 +261,16 @@ __device__ __forceinline__ float col_max4_sc(const s4_tile &s, float scale) {
     return fmaxf(mx, __shfl_xor(mx, 32)) * scale;
 }
 
-// Packed mul+add, not fma: fmaf(-inf, scale, -mnew) nans when mnew is -inf.
+// Causal tiles always contain at least one unmasked key for every query row,
+// so mnew is finite on the hot path.  Fuse score*scale-mnew with V_PK_FMA_F32
+// instead of issuing separate packed MUL and ADD instructions.
 __device__ __forceinline__ void exp2_sc(fx16 &s, float scale, float mnew) {
     const f2 sc = {scale, scale};
     const f2 nm = {-mnew, -mnew};
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         f2 v = {s[2 * i], s[2 * i + 1]};
-        asm volatile("v_pk_mul_f32 %0, %1, %2" : "+v"(v) : "v"(sc));
-        asm volatile("v_pk_add_f32 %0, %1, %2" : "+v"(v) : "v"(nm));
+        asm volatile("v_pk_fma_f32 %0, %0, %1, %2" : "+v"(v) : "v"(sc), "v"(nm));
         s[2 * i] = exp2f(v[0]);
         s[2 * i + 1] = exp2f(v[1]);
     }
