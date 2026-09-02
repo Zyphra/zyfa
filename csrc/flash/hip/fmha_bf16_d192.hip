@@ -1,5 +1,9 @@
 // HK GQA causal + XCD pair, bf16 32x32x16, KN=64, streamed LDS K/V.
 // One bar per tile (next iter's bar covers V lifetime). Research kernel. D=192 / Dv=128 / 8-wave / causal only. Do not fold into fmha32.hip.
+// RESCALE_SKIP: true (default) = HK Δmax≤8 delayed update. false = always rescale.
+#ifndef RESCALE_SKIP
+#define RESCALE_SKIP true
+#endif
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
@@ -41,26 +45,39 @@ __device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
 __device__ __forceinline__ void softmax_pv(o_tile &o, s_tile &s, const st_v &vsm, float &m_, float &l_) {
     const float mx = col_max2(s);
     const float mnew = fmaxf(m_, mx);
+#if RESCALE_SKIP
+    const float dmax = mnew - m_;
+    const int skip = __all(dmax <= RESCALE_THRESHOLD);
+    float corr = 1.f;
+    float mref = m_;
+    if (!__builtin_expect(skip, 1)) {
+        corr = (dmax > 0.f) ? exp2f(-dmax) : 1.f;
+        if (__builtin_expect(m_ != neg_inf(), 1))
+            rescale_o(o, corr);
+        mref = mnew;
+        m_ = mnew;
+    }
+#else
     const float corr = (mnew > m_) ? exp2f(m_ - mnew) : 1.f;
-    // o is known-zero before the first KV tile; do not broadcast corr=0
-    // and multiply the entire output accumulator by zero.
     if (__builtin_expect(m_ != neg_inf(), 1))
         rescale_o(o, corr);
-    exp2_m(s.a, mnew);
+    const float mref = mnew;
+    m_ = mnew;
+#endif
+    exp2_m(s.a, mref);
     p_tile p;
     p.a = cvt8(s.a, 0);
     p.b = cvt8(s.a, 8);
     __builtin_amdgcn_s_setprio(1);
     mma_pv_sl<0>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
     mma_pv_sl<1>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
-    exp2_m(s.b, mnew);
+    exp2_m(s.b, mref);
     p.c = cvt8(s.b, 0);
     p.d = cvt8(s.b, 8);
     mma_pv_sl<2>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
     mma_pv_sl<3>(o, *reinterpret_cast<const st<64, 128> *>(&vsm), p);
     __builtin_amdgcn_s_setprio(0);
     l_ = l_ * corr + col_sum2(s);
-    m_ = mnew;
 }
 
 template <bool PairHeads>

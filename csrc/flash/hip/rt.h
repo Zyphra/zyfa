@@ -29,7 +29,16 @@ __device__ __forceinline__ fx16 mfma16(v8b a, v8b b, fx16 c) {
     return __builtin_amdgcn_mfma_f32_32x32x16_bf16(a, b, c, 0, 0, 0);
 }
 
-__device__ __forceinline__ int rv_all_below(float prev, float cur, float T) { return (cur - prev <= T); }
+// HipKittens delayed rescale: if every lane's Δmax ≤ T, keep old m (no O/L scale).
+// RESCALE_SKIP=true (default). RESCALE_SKIP=false always rescales.
+#ifndef RESCALE_SKIP
+#define RESCALE_SKIP true
+#endif
+constexpr float RESCALE_THRESHOLD = 8.f;
+
+__device__ __forceinline__ int rv_all_below(float prev, float cur, float T = RESCALE_THRESHOLD) {
+    return (cur - prev <= T);
+}
 __device__ __forceinline__ int wave_all_ok(int lane_ok) { return __all(lane_ok); }
 
 __device__ __forceinline__ v8b v8b_zero() {

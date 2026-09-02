@@ -1,5 +1,9 @@
 // HK GQA causal + XCD pair, fp8 fat 32x32x64, KN=128, streamed LDS K/V.
 // One bar per tile (next iter's bar covers V lifetime). Research kernel. D=Dv=128 / 8-wave / causal only. Do not fold into fmha_fp8.hip.
+// RESCALE_SKIP: true (default) = HK Δmax≤8 delayed update. false = always rescale.
+#ifndef RESCALE_SKIP
+#define RESCALE_SKIP true
+#endif
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
@@ -49,21 +53,35 @@ __device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
 __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase, float scale, float &m_, float &l_) {
     const float mx = col_max4_sc(s, scale);
     const float mnew = fmaxf(m_, mx);
+#if RESCALE_SKIP
+    const float dmax = mnew - m_;
+    const int skip = __all(dmax <= RESCALE_THRESHOLD);
+    float corr = 1.f;
+    float mref = m_;
+    if (!__builtin_expect(skip, 1)) {
+        corr = exp2f(-dmax);
+        if (__builtin_expect(m_ != neg_inf(), 1))
+            rescale_o(o, corr);
+        mref = mnew;
+        m_ = mnew;
+    }
+#else
     const float corr = exp2f(m_ - mnew);
-    // o is known-zero before the first KV tile.
     if (__builtin_expect(m_ != neg_inf(), 1))
         rescale_o(o, corr);
+    const float mref = mnew;
+    m_ = mnew;
+#endif
     pv_v_head vh = preissue_pv_v(vbase, 0);
-    exp2_sc(s.a, scale, mnew);
-    exp2_sc(s.b, scale, mnew);
+    exp2_sc(s.a, scale, mref);
+    exp2_sc(s.b, scale, mref);
     __builtin_amdgcn_s_setprio(1);
     mma_pv_lds_preissued(o, vbase, pack_p(s.a, s.b), 0, vh);
-    exp2_sc(s.c, scale, mnew);
-    exp2_sc(s.d, scale, mnew);
+    exp2_sc(s.c, scale, mref);
+    exp2_sc(s.d, scale, mref);
     mma_pv_lds(o, vbase, pack_p(s.c, s.d), 2);
     __builtin_amdgcn_s_setprio(0);
     l_ = l_ * corr + col_sum4(s);
-    m_ = mnew;
 }
 
 template <bool PairHeads>

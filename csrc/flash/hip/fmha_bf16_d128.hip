@@ -1,18 +1,22 @@
-// HK GQA causal + XCD pair, fp8 fat 32x32x64, KN=64, streamed LDS K/V.
-// One bar per tile (next iter's bar covers V lifetime). Research kernel. D=192 / Dv=128 / 8-wave / causal only. Do not fold into fmha_fp8.hip.
+// HK GQA causal + XCD pair, bf16 32x32x16, KN=128, streamed LDS K/V.
+// One bar per tile (next iter's bar covers V lifetime). Research kernel. D=Dv=128 / 8-wave / causal only. Do not fold into fmha32.hip.
+// RESCALE_SKIP: true (default) = HK Δmax≤8 delayed update. false = always rescale.
+#ifndef RESCALE_SKIP
+#define RESCALE_SKIP true
+#endif
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
-#include "rt_fp8_d192.h"
+#include "rt_bf16_d128.h"
 #include "xcd_map.h"
 
-namespace fmha_fp8_d192 {
+namespace fmha_bf16_d128 {
 
 using namespace hk;
-using namespace hk8_192;
+using namespace hk16;
 
 constexpr int Q_BLOCK = 32;
-constexpr int KV_BLOCK = 64;
+constexpr int KV_BLOCK = 128;
 constexpr int NW = 8;
 constexpr int NT = 512;
 constexpr float L2E = 1.4426950408889634f;
@@ -21,55 +25,80 @@ constexpr float LN2 = 0.6931471805599453f;
 __device__ __forceinline__ __attribute__((convergent)) void wg_bar() { __syncthreads(); }
 
 struct alignas(16) Smem {
-    st_k k[2];
-    st_v v[2];
+    st16 k[2];
+    st16 v[2];
 };
 
-__device__ __forceinline__ const unsigned char *kv_tile_ptr(const unsigned char *base, int tile, int dim) {
-    return base + (size_t)tile * KV_BLOCK * dim;
+__device__ __forceinline__ const bf16 *kv_tile_ptr(const bf16 *base, int tile, int D) {
+    return base + (size_t)tile * KV_BLOCK * D;
 }
 
 __device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
     if (!__any(corr != 1.f))
         return;
-    const int gb = laneid() >> 5;
-    float ct[16];
-#pragma unroll
-    for (int r = 0; r < 16; ++r)
-        ct[r] = __shfl(corr, fmha_qoff(r, gb));
-#pragma unroll
-    for (int r = 0; r < 16; ++r) {
-        o.a[r] *= ct[r];
-        o.b[r] *= ct[r];
-        o.c[r] *= ct[r];
-        o.d[r] *= ct[r];
-    }
+    o.a = mulsc(o.a, corr);
+    o.b = mulsc(o.b, corr);
+    o.c = mulsc(o.c, corr);
+    o.d = mulsc(o.d, corr);
 }
 
-__device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase, float scale, float &m_, float &l_) {
-    const float mx = col_max2_sc(s, scale);
+__device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, const st16 &vsm, float &m_, float &l_) {
+    const float mx = col_max4(s);
     const float mnew = fmaxf(m_, mx);
+#if RESCALE_SKIP
+    const float dmax = mnew - m_;
+    const int skip = __all(dmax <= RESCALE_THRESHOLD);
+    float corr = 1.f;
+    float mref = m_;
+    if (!__builtin_expect(skip, 1)) {
+        corr = (dmax > 0.f) ? exp2f(-dmax) : 1.f;
+        if (__builtin_expect(m_ != neg_inf(), 1))
+            rescale_o(o, corr);
+        mref = mnew;
+        m_ = mnew;
+    }
+#else
     const float corr = (mnew > m_) ? exp2f(m_ - mnew) : 1.f;
-    // o is known-zero before the first KV tile.
     if (__builtin_expect(m_ != neg_inf(), 1))
         rescale_o(o, corr);
-    hk8::exp2_sc(s.a, scale, mnew);
-    __builtin_amdgcn_s_setprio(1);
-    hk8::exp2_sc(s.b, scale, mnew);
-    mma_pv_lds(o, vbase, pack_p(s.a, s.b));
-    __builtin_amdgcn_s_setprio(0);
-    l_ = l_ * corr + col_sum2(s);
+    const float mref = mnew;
     m_ = mnew;
+#endif
+    const auto &vlo = *reinterpret_cast<const st<64, 128> *>(&vsm.data[0]);
+    const auto &vhi = *reinterpret_cast<const st<64, 128> *>(&vsm.data[64 * Dv]);
+    p_tile p;
+    exp2_m(s.a, mref);
+    p.a = cvt8(s.a, 0);
+    p.b = cvt8(s.a, 8);
+    __builtin_amdgcn_s_setprio(1);
+    mma_pv_sl<0>(o, vlo, p);
+    mma_pv_sl<1>(o, vlo, p);
+    exp2_m(s.b, mref);
+    p.c = cvt8(s.b, 0);
+    p.d = cvt8(s.b, 8);
+    mma_pv_sl<2>(o, vlo, p);
+    mma_pv_sl<3>(o, vlo, p);
+    exp2_m(s.c, mref);
+    p.a = cvt8(s.c, 0);
+    p.b = cvt8(s.c, 8);
+    mma_pv_sl<0>(o, vhi, p);
+    mma_pv_sl<1>(o, vhi, p);
+    exp2_m(s.d, mref);
+    p.c = cvt8(s.d, 0);
+    p.d = cvt8(s.d, 8);
+    mma_pv_sl<2>(o, vhi, p);
+    mma_pv_sl<3>(o, vhi, p);
+    __builtin_amdgcn_s_setprio(0);
+    l_ = l_ * corr + col_sum4(s);
 }
 
 template <bool PairHeads>
-__global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, const unsigned char *K,
-                                                    const unsigned char *V, float *O, float *Lse, int M, int N, int Hq,
-                                                    int Hkv, float scale, int nxcd) {
+__global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K, const bf16 *V, float *O, float *Lse,
+                                                    int M, int N, int Hq, int Hkv, float scale, int nxcd) {
     extern __shared__ Smem sm[];
     Smem &s = sm[0];
 
-    constexpr int D = 192, Dv = 128;
+    constexpr int D = 128;
     const int GROUP = Hq / Hkv;
     constexpr int QW = PairHeads ? (NW / 2) : NW;
     const int numQ = (M / Q_BLOCK + QW - 1) / QW;
@@ -101,10 +130,10 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         qwarp = warpid();
     }
 
-    const unsigned char *Qh = Q + ((size_t)batch_idx * Hq + head_idx) * M * D;
-    const unsigned char *Kh = K + ((size_t)batch_idx * Hkv + head_kv) * N * D;
-    const unsigned char *Vh = V + ((size_t)batch_idx * Hkv + head_kv) * N * Dv;
-    float *Oh = O + ((size_t)batch_idx * Hq + head_idx) * M * Dv;
+    const bf16 *Qh = Q + ((size_t)batch_idx * Hq + head_idx) * M * D;
+    const bf16 *Kh = K + ((size_t)batch_idx * Hkv + head_kv) * N * D;
+    const bf16 *Vh = V + ((size_t)batch_idx * Hkv + head_kv) * N * D;
+    float *Oh = O + ((size_t)batch_idx * Hq + head_idx) * M * D;
     float *Lh = Lse ? Lse + ((size_t)batch_idx * Hq + head_idx) * M : nullptr;
 
     const int num_tiles = N / KV_BLOCK;
@@ -122,17 +151,18 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             max_num_tiles = num_tiles;
         const int q_start = tile_idx * Q_BLOCK;
 
-        q8_tile192 qT;
+        q_tile qT;
+        load_q(qT, Qh + (size_t)tile_idx * Q_BLOCK * D, scale);
+        pin_q(qT);
         o_tile oR;
         zero_o(oR);
-        load_q8(qT, Qh + (size_t)tile_idx * Q_BLOCK * D);
-        pin_q192(qT);
+        pin_o(oR);
         float m_ = neg_inf(), l_ = 0.f;
 
         if (pp)
             wg_bar();
         prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, D));
-        prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, Dv));
+        prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, D));
 
         for (int kb = 0; kb < max_num_tiles; ++kb) {
             const int cur = kb & 1, nx = cur ^ 1;
@@ -141,25 +171,36 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             else
                 asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
             wg_bar();
-            const uint32_t kbase = lds_u32(s.k[cur].data);
-            const uint32_t vbase = lds_u32(s.v[cur].data);
+            uint32_t kbase = lds_u32(s.k[cur].data);
+            asm volatile("" : "+v"(kbase));
             const int kb_n = (kb + 1 < max_num_tiles) ? kb + 1 : kb;
-            const unsigned char *gKn = kv_tile_ptr(Kh, kb_n, D);
-            const unsigned char *gVn = kv_tile_ptr(Vh, kb_n, Dv);
-            s2_tile att;
+            const bf16 *gKn = kv_tile_ptr(Kh, kb_n, D);
+            const bf16 *gVn = kv_tile_ptr(Vh, kb_n, D);
+            s4_tile att;
+            zero_s4(att);
+            pin_s4(att);
             prefetch_k_pass<0>(s.k[nx], gKn);
-            mma_qk_pair<false>(att, k_off(kbase, 0), qT.d0);
+            mma_qk_quad(att, k_off(kbase, 0), qT.d0);
+            mma_qk_quad(att, k_off(kbase, 1), qT.d1);
             prefetch_k_pass<1>(s.k[nx], gKn);
-            mma_qk_pair<true>(att, k_off(kbase, 1), qT.d1);
-            prefetch_v(s.v[nx], gVn);
-            mma_qk_pair<true>(att, k_off(kbase, 2), qT.d2);
+            mma_qk_quad(att, k_off(kbase, 2), qT.d2);
+            prefetch_v_pass<0>(s.v[nx], gVn);
+            mma_qk_quad(att, k_off(kbase, 3), qT.d3);
+            prefetch_k_pass<2>(s.k[nx], gKn);
+            mma_qk_quad(att, k_off(kbase, 4), qT.d4);
+            prefetch_v_pass<1>(s.v[nx], gVn);
+            mma_qk_quad(att, k_off(kbase, 5), qT.d5);
+            prefetch_k_pass<3>(s.k[nx], gKn);
+            mma_qk_quad(att, k_off(kbase, 6), qT.d6);
+            prefetch_v_pass<2>(s.v[nx], gVn);
+            mma_qk_quad(att, k_off(kbase, 7), qT.d7);
+            prefetch_v_pass<3>(s.v[nx], gVn);
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
-                mask_s2(att, q_start, kb);
-
-            softmax_pv(oR, att, vbase, scale, m_, l_);
+                mask_s4(att, q_start, kb);
+            softmax_pv(oR, att, s.v[cur], m_, l_);
         }
 
-        store_o_fp8(Oh, q_start, M, oR, l_);
+        store_o(Oh, q_start, M, oR, l_);
         if (Lh) {
             const float lse = m_ * LN2 + logf(l_);
             store_lse(Lh, q_start, M, lse);
@@ -167,8 +208,8 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
     }
 }
 
-static void run(const unsigned char *Q, const unsigned char *K, const unsigned char *V, float *O, float *Lse, int M,
-                int N, int B, int Hq, int Hkv, float scale, hipStream_t stream) {
+static void run(const bf16 *Q, const bf16 *K, const bf16 *V, float *O, float *Lse, int M, int N, int B, int Hq, int Hkv,
+                float scale, hipStream_t stream) {
     const int GROUP = Hq / Hkv;
     const bool pair_heads = GROUP >= 2 && (GROUP & 1) == 0;
     const int q_waves = pair_heads ? (NW / 2) : NW;
@@ -177,26 +218,26 @@ static void run(const unsigned char *Q, const unsigned char *K, const unsigned c
     const int nxcd = fmha_num_xcds();
     const size_t smem = sizeof(Smem);
     if (pair_heads) {
-        hipFuncSetAttribute((const void *)attend_ker<true>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+        hipFuncSetAttribute((const void *)attend_ker<true>, hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         attend_ker<true><<<nq_pairs * B * (Hq / 2), NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
     } else {
-        hipFuncSetAttribute((const void *)attend_ker<false>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+        hipFuncSetAttribute((const void *)attend_ker<false>, hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         attend_ker<false><<<nq_pairs * B * Hq, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
     }
 }
 
-std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale,
-                                              bool causal, bool return_lse) {
-    TORCH_CHECK(causal, "fmha_fp8_d192 is causal-only");
+std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, bool causal,
+                                          bool return_lse) {
+    TORCH_CHECK(causal, "fmha_bf16 is causal-only");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
-    TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fn, "fmha_fp8_d192 needs float8_e4m3fn");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "fmha_bf16 needs bfloat16");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q,k,v must be [B,H,S,D]");
     q = q.contiguous();
     k = k.contiguous();
     v = v.contiguous();
     const int B = q.size(0), Hq = q.size(1), M = q.size(2), D = q.size(3);
     const int Hkv = k.size(1), N = k.size(2), Dv = v.size(3);
-    TORCH_CHECK(D == 192 && Dv == 128 && M % 256 == 0 && N % 64 == 0);
+    TORCH_CHECK(D == 128 && Dv == 128 && M % 256 == 0 && N % 128 == 0);
     TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && v.size(1) == Hkv && v.size(2) == N);
     auto O = torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kFloat));
     torch::Tensor Lse;
@@ -205,12 +246,12 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
         Lse = torch::empty({B * Hq, M}, q.options().dtype(at::kFloat));
         Lp = Lse.data_ptr<float>();
     }
-    run((const unsigned char *)q.data_ptr(), (const unsigned char *)k.data_ptr(),
-        (const unsigned char *)v.data_ptr(), O.data_ptr<float>(), Lp, M, N, B, Hq, Hkv, (float)scale * L2E,
+    run(reinterpret_cast<const bf16 *>(q.data_ptr()), reinterpret_cast<const bf16 *>(k.data_ptr()),
+        reinterpret_cast<const bf16 *>(v.data_ptr()), O.data_ptr<float>(), Lp, M, N, B, Hq, Hkv, (float)scale * L2E,
         at::cuda::getCurrentCUDAStream());
     if (return_lse)
         return {O, Lse};
     return {O};
 }
 
-} // namespace fmha_fp8_d192
+} // namespace fmha_bf16_d128
