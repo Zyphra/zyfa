@@ -29,8 +29,8 @@ struct alignas(16) Smem {
     st16 v[2];
 };
 
-__device__ __forceinline__ const bf16 *kv_tile_ptr(const bf16 *base, int tile, int D) {
-    return base + (size_t)tile * KV_BLOCK * D;
+__device__ __forceinline__ const bf16 *kv_tile_ptr(const bf16 *base, int tile, int seq_stride) {
+    return base + (size_t)tile * KV_BLOCK * seq_stride;
 }
 
 __device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
@@ -92,13 +92,17 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, const st16 &vs
     l_ = l_ * corr + col_sum4(s);
 }
 
-template <bool PairHeads>
+// Bshd=false: BHSD [B,H,S,D], seq stride D (current benches).
+// Bshd=true:  BSHD [B,S,H,D], seq stride H*D. D-axis still packed.
+template <bool PairHeads, bool Bshd>
 __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K, const bf16 *V, float *O, float *Lse,
                                                     int M, int N, int Hq, int Hkv, float scale, int nxcd) {
     extern __shared__ Smem sm[];
     Smem &s = sm[0];
 
     constexpr int D = 128;
+    const int q_stride = Bshd ? Hq * D : D;
+    const int kv_stride = Bshd ? Hkv * D : D;
     const int GROUP = Hq / Hkv;
     constexpr int QW = PairHeads ? (NW / 2) : NW;
     const int numQ = (M / Q_BLOCK + QW - 1) / QW;
@@ -130,10 +134,19 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
         qwarp = warpid();
     }
 
-    const bf16 *Qh = Q + ((size_t)batch_idx * Hq + head_idx) * M * D;
-    const bf16 *Kh = K + ((size_t)batch_idx * Hkv + head_kv) * N * D;
-    const bf16 *Vh = V + ((size_t)batch_idx * Hkv + head_kv) * N * D;
-    float *Oh = O + ((size_t)batch_idx * Hq + head_idx) * M * D;
+    const bf16 *Qh, *Kh, *Vh;
+    float *Oh;
+    if constexpr (Bshd) {
+        Qh = Q + ((size_t)batch_idx * M * Hq + (size_t)head_idx) * D;
+        Kh = K + ((size_t)batch_idx * N * Hkv + (size_t)head_kv) * D;
+        Vh = V + ((size_t)batch_idx * N * Hkv + (size_t)head_kv) * D;
+        Oh = O + ((size_t)batch_idx * M * Hq + (size_t)head_idx) * D;
+    } else {
+        Qh = Q + ((size_t)batch_idx * Hq + head_idx) * M * D;
+        Kh = K + ((size_t)batch_idx * Hkv + head_kv) * N * D;
+        Vh = V + ((size_t)batch_idx * Hkv + head_kv) * N * D;
+        Oh = O + ((size_t)batch_idx * Hq + head_idx) * M * D;
+    }
     float *Lh = Lse ? Lse + ((size_t)batch_idx * Hq + head_idx) * M : nullptr;
 
     const int num_tiles = N / KV_BLOCK;
@@ -152,7 +165,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
         const int q_start = tile_idx * Q_BLOCK;
 
         q_tile qT;
-        load_q(qT, Qh + (size_t)tile_idx * Q_BLOCK * D, scale);
+        load_q(qT, Qh + (size_t)tile_idx * Q_BLOCK * q_stride, scale, q_stride);
         pin_q(qT);
         o_tile oR;
         zero_o(oR);
@@ -161,8 +174,8 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
 
         if (pp)
             wg_bar();
-        prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, D));
-        prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, D));
+        prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, kv_stride), kv_stride);
+        prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, kv_stride), kv_stride);
 
         for (int kb = 0; kb < max_num_tiles; ++kb) {
             const int cur = kb & 1, nx = cur ^ 1;
@@ -174,33 +187,33 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
             uint32_t kbase = lds_u32(s.k[cur].data);
             asm volatile("" : "+v"(kbase));
             const int kb_n = (kb + 1 < max_num_tiles) ? kb + 1 : kb;
-            const bf16 *gKn = kv_tile_ptr(Kh, kb_n, D);
-            const bf16 *gVn = kv_tile_ptr(Vh, kb_n, D);
+            const bf16 *gKn = kv_tile_ptr(Kh, kb_n, kv_stride);
+            const bf16 *gVn = kv_tile_ptr(Vh, kb_n, kv_stride);
             s4_tile att;
             zero_s4(att);
             pin_s4(att);
-            prefetch_k_pass<0>(s.k[nx], gKn);
+            prefetch_k_pass<0>(s.k[nx], gKn, kv_stride);
             mma_qk_quad(att, k_off(kbase, 0), qT.d0);
             mma_qk_quad(att, k_off(kbase, 1), qT.d1);
-            prefetch_k_pass<1>(s.k[nx], gKn);
+            prefetch_k_pass<1>(s.k[nx], gKn, kv_stride);
             mma_qk_quad(att, k_off(kbase, 2), qT.d2);
-            prefetch_v_pass<0>(s.v[nx], gVn);
+            prefetch_v_pass<0>(s.v[nx], gVn, kv_stride);
             mma_qk_quad(att, k_off(kbase, 3), qT.d3);
-            prefetch_k_pass<2>(s.k[nx], gKn);
+            prefetch_k_pass<2>(s.k[nx], gKn, kv_stride);
             mma_qk_quad(att, k_off(kbase, 4), qT.d4);
-            prefetch_v_pass<1>(s.v[nx], gVn);
+            prefetch_v_pass<1>(s.v[nx], gVn, kv_stride);
             mma_qk_quad(att, k_off(kbase, 5), qT.d5);
-            prefetch_k_pass<3>(s.k[nx], gKn);
+            prefetch_k_pass<3>(s.k[nx], gKn, kv_stride);
             mma_qk_quad(att, k_off(kbase, 6), qT.d6);
-            prefetch_v_pass<2>(s.v[nx], gVn);
+            prefetch_v_pass<2>(s.v[nx], gVn, kv_stride);
             mma_qk_quad(att, k_off(kbase, 7), qT.d7);
-            prefetch_v_pass<3>(s.v[nx], gVn);
+            prefetch_v_pass<3>(s.v[nx], gVn, kv_stride);
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s4(att, q_start, kb);
             softmax_pv(oR, att, s.v[cur], m_, l_);
         }
 
-        store_o(Oh, q_start, M, oR, l_);
+        store_o(Oh, q_start, M, oR, l_, q_stride);
         if (Lh) {
             const float lse = m_ * LN2 + logf(l_);
             store_lse(Lh, q_start, M, lse);
@@ -209,7 +222,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
 }
 
 static void run(const bf16 *Q, const bf16 *K, const bf16 *V, float *O, float *Lse, int M, int N, int B, int Hq, int Hkv,
-                float scale, hipStream_t stream) {
+                float scale, bool bshd, hipStream_t stream) {
     const int GROUP = Hq / Hkv;
     const bool pair_heads = GROUP >= 2 && (GROUP & 1) == 0;
     const int q_waves = pair_heads ? (NW / 2) : NW;
@@ -217,29 +230,54 @@ static void run(const bf16 *Q, const bf16 *K, const bf16 *V, float *O, float *Ls
     const int nq_pairs = (numQ + 1) / 2;
     const int nxcd = fmha_num_xcds();
     const size_t smem = sizeof(Smem);
-    if (pair_heads) {
-        hipFuncSetAttribute((const void *)attend_ker<true>, hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        attend_ker<true><<<nq_pairs * B * (Hq / 2), NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    const int nheads = pair_heads ? (Hq / 2) : Hq;
+    if (pair_heads && bshd) {
+        hipFuncSetAttribute((const void *)attend_ker<true, true>, hipFuncAttributeMaxDynamicSharedMemorySize,
+                            (int)smem);
+        attend_ker<true, true>
+            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    } else if (pair_heads) {
+        hipFuncSetAttribute((const void *)attend_ker<true, false>, hipFuncAttributeMaxDynamicSharedMemorySize,
+                            (int)smem);
+        attend_ker<true, false>
+            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    } else if (bshd) {
+        hipFuncSetAttribute((const void *)attend_ker<false, true>, hipFuncAttributeMaxDynamicSharedMemorySize,
+                            (int)smem);
+        attend_ker<false, true>
+            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
     } else {
-        hipFuncSetAttribute((const void *)attend_ker<false>, hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        attend_ker<false><<<nq_pairs * B * Hq, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+        hipFuncSetAttribute((const void *)attend_ker<false, false>, hipFuncAttributeMaxDynamicSharedMemorySize,
+                            (int)smem);
+        attend_ker<false, false>
+            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
     }
 }
 
 std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, bool causal,
-                                          bool return_lse) {
+                                          bool return_lse, bool bshd) {
     TORCH_CHECK(causal, "fmha_bf16 is causal-only");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
     TORCH_CHECK(q.scalar_type() == at::kBFloat16, "fmha_bf16 needs bfloat16");
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q,k,v must be [B,H,S,D]");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+                bshd ? "q,k,v must be BSHD [B,S,H,D]" : "q,k,v must be BHSD [B,H,S,D]");
     q = q.contiguous();
     k = k.contiguous();
     v = v.contiguous();
-    const int B = q.size(0), Hq = q.size(1), M = q.size(2), D = q.size(3);
-    const int Hkv = k.size(1), N = k.size(2), Dv = v.size(3);
+    const int B = q.size(0), D = q.size(3), Dv = v.size(3);
+    const int Hq = bshd ? q.size(2) : q.size(1);
+    const int M = bshd ? q.size(1) : q.size(2);
+    const int Hkv = bshd ? k.size(2) : k.size(1);
+    const int N = bshd ? k.size(1) : k.size(2);
     TORCH_CHECK(D == 128 && Dv == 128 && M % 256 == 0 && N % 128 == 0);
-    TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && v.size(1) == Hkv && v.size(2) == N);
-    auto O = torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kFloat));
+    TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
+    if (bshd) {
+        TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);
+    } else {
+        TORCH_CHECK(v.size(1) == Hkv && v.size(2) == N);
+    }
+    auto O = bshd ? torch::empty({B, M, Hq, Dv}, q.options().dtype(at::kFloat))
+                  : torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kFloat));
     torch::Tensor Lse;
     float *Lp = nullptr;
     if (return_lse) {
@@ -248,7 +286,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     }
     run(reinterpret_cast<const bf16 *>(q.data_ptr()), reinterpret_cast<const bf16 *>(k.data_ptr()),
         reinterpret_cast<const bf16 *>(v.data_ptr()), O.data_ptr<float>(), Lp, M, N, B, Hq, Hkv, (float)scale * L2E,
-        at::cuda::getCurrentCUDAStream());
+        bshd, at::cuda::getCurrentCUDAStream());
     if (return_lse)
         return {O, Lse};
     return {O};

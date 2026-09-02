@@ -40,33 +40,33 @@ struct alignas(16) st_v {
 };
 
 template <int Pass>
-__device__ __forceinline__ void prefetch_k_pass(st_k &sm, const bf16 *g) {
+__device__ __forceinline__ void prefetch_k_pass(st_k &sm, const bf16 *g, int seq_stride = D) {
     const int c = (int)threadIdx.x + Pass * 512;
     const int key = c / CPR, P = c % CPR;
     const int L = (P - key) & (CPR - 1);
     const int Ls = (L < 24) ? L : 0;
-    HK192_GLD16(g + (size_t)key * D + Ls * 8, sm.data + c * 8);
+    HK192_GLD16(g + (size_t)key * seq_stride + Ls * 8, sm.data + c * 8);
 }
 
 template <int Pass>
-__device__ __forceinline__ void prefetch_v_pass(st_v &sm, const bf16 *g) {
+__device__ __forceinline__ void prefetch_v_pass(st_v &sm, const bf16 *g, int seq_stride = Dv) {
     const int c = (int)threadIdx.x + Pass * 512;
     const int pp = c * 8, tl = pp / 64, wi = pp % 64;
     const int ky = (tl / (Dv / 16)) * 4 + wi / 16;
     const int dvv = (tl % (Dv / 16)) * 16 + wi % 16;
-    HK192_GLD16(g + (size_t)ky * Dv + dvv, sm.data + c * 8);
+    HK192_GLD16(g + (size_t)ky * seq_stride + dvv, sm.data + c * 8);
 }
 
-__device__ __forceinline__ void prefetch_k(st_k &sm, const bf16 *g) {
-    prefetch_k_pass<0>(sm, g);
-    prefetch_k_pass<1>(sm, g);
-    prefetch_k_pass<2>(sm, g);
-    prefetch_k_pass<3>(sm, g);
+__device__ __forceinline__ void prefetch_k(st_k &sm, const bf16 *g, int seq_stride = D) {
+    prefetch_k_pass<0>(sm, g, seq_stride);
+    prefetch_k_pass<1>(sm, g, seq_stride);
+    prefetch_k_pass<2>(sm, g, seq_stride);
+    prefetch_k_pass<3>(sm, g, seq_stride);
 }
 
-__device__ __forceinline__ void prefetch_v(st_v &sm, const bf16 *g) {
-    prefetch_v_pass<0>(sm, g);
-    prefetch_v_pass<1>(sm, g);
+__device__ __forceinline__ void prefetch_v(st_v &sm, const bf16 *g, int seq_stride = Dv) {
+    prefetch_v_pass<0>(sm, g, seq_stride);
+    prefetch_v_pass<1>(sm, g, seq_stride);
 }
 
 __device__ __forceinline__ v8b load16(const bf16 *p) {
@@ -83,20 +83,20 @@ __device__ __forceinline__ v8b load16_scale(const bf16 *p, float sc) {
     return x;
 }
 
-__device__ __forceinline__ void load_q(q_tile192 &dst, const bf16 *g, float sc) {
+__device__ __forceinline__ void load_q(q_tile192 &dst, const bf16 *g, float sc, int seq_stride = D) {
     const int c32 = laneid() & 31, gb = laneid() >> 5;
-    dst.d0 = load16_scale(g + (size_t)c32 * D + 0 * 16 + gb * 8, sc);
-    dst.d1 = load16_scale(g + (size_t)c32 * D + 1 * 16 + gb * 8, sc);
-    dst.d2 = load16_scale(g + (size_t)c32 * D + 2 * 16 + gb * 8, sc);
-    dst.d3 = load16_scale(g + (size_t)c32 * D + 3 * 16 + gb * 8, sc);
-    dst.d4 = load16_scale(g + (size_t)c32 * D + 4 * 16 + gb * 8, sc);
-    dst.d5 = load16_scale(g + (size_t)c32 * D + 5 * 16 + gb * 8, sc);
-    dst.d6 = load16_scale(g + (size_t)c32 * D + 6 * 16 + gb * 8, sc);
-    dst.d7 = load16_scale(g + (size_t)c32 * D + 7 * 16 + gb * 8, sc);
-    dst.d8 = load16_scale(g + (size_t)c32 * D + 8 * 16 + gb * 8, sc);
-    dst.d9 = load16_scale(g + (size_t)c32 * D + 9 * 16 + gb * 8, sc);
-    dst.d10 = load16_scale(g + (size_t)c32 * D + 10 * 16 + gb * 8, sc);
-    dst.d11 = load16_scale(g + (size_t)c32 * D + 11 * 16 + gb * 8, sc);
+    dst.d0 = load16_scale(g + (size_t)c32 * seq_stride + 0 * 16 + gb * 8, sc);
+    dst.d1 = load16_scale(g + (size_t)c32 * seq_stride + 1 * 16 + gb * 8, sc);
+    dst.d2 = load16_scale(g + (size_t)c32 * seq_stride + 2 * 16 + gb * 8, sc);
+    dst.d3 = load16_scale(g + (size_t)c32 * seq_stride + 3 * 16 + gb * 8, sc);
+    dst.d4 = load16_scale(g + (size_t)c32 * seq_stride + 4 * 16 + gb * 8, sc);
+    dst.d5 = load16_scale(g + (size_t)c32 * seq_stride + 5 * 16 + gb * 8, sc);
+    dst.d6 = load16_scale(g + (size_t)c32 * seq_stride + 6 * 16 + gb * 8, sc);
+    dst.d7 = load16_scale(g + (size_t)c32 * seq_stride + 7 * 16 + gb * 8, sc);
+    dst.d8 = load16_scale(g + (size_t)c32 * seq_stride + 8 * 16 + gb * 8, sc);
+    dst.d9 = load16_scale(g + (size_t)c32 * seq_stride + 9 * 16 + gb * 8, sc);
+    dst.d10 = load16_scale(g + (size_t)c32 * seq_stride + 10 * 16 + gb * 8, sc);
+    dst.d11 = load16_scale(g + (size_t)c32 * seq_stride + 11 * 16 + gb * 8, sc);
 }
 
 __device__ __forceinline__ uint32_t lds_u32(const bf16 *p) {
@@ -158,14 +158,15 @@ __device__ __forceinline__ float col_sum2(const s_tile &s) {
     return t + __shfl_xor(t, 32);
 }
 
-__device__ __forceinline__ void store_o(float *O, int q_base, int M, const o_tile &o, float l_) {
+__device__ __forceinline__ void store_o(float *O, int q_base, int M, const o_tile &o, float l_,
+                                        int seq_stride = Dv) {
     const float inv = (l_ > 0.f) ? __builtin_amdgcn_rcpf(l_) : 0.f;
     o_tile t;
     t.a = mulsc(o.a, inv);
     t.b = mulsc(o.b, inv);
     t.c = mulsc(o.c, inv);
     t.d = mulsc(o.d, inv);
-    hk::store_o(O, Dv, q_base, M, t);
+    hk::store_o(O, seq_stride, q_base, M, t);
 }
 
 #undef HK192_GLD16

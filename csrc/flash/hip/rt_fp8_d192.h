@@ -47,34 +47,34 @@ struct alignas(16) st_v {
 };
 
 template <int Pass>
-__device__ __forceinline__ void prefetch_k_pass(st_k &sm, const unsigned char *g) {
+__device__ __forceinline__ void prefetch_k_pass(st_k &sm, const unsigned char *g, int seq_stride = D) {
     const int c = (int)threadIdx.x + Pass * 512;
     const int key = c / 16, chunk = c & 15;
     const int P = chunk >> 1, r = (chunk & 1) * 16;
     const int L = (P - key) & (CPR - 1);
     const int Ls = (L < 6) ? L : 0;
-    HK8_192_GLD16(g + (size_t)key * D + Ls * 32 + r, sm.data + c * 16);
+    HK8_192_GLD16(g + (size_t)key * seq_stride + Ls * 32 + r, sm.data + c * 16);
 }
 
-__device__ __forceinline__ void prefetch_v(st_v &sm, const unsigned char *g) {
+__device__ __forceinline__ void prefetch_v(st_v &sm, const unsigned char *g, int seq_stride = Dv) {
     constexpr int NK_BITS = 1;
     const int c = (int)threadIdx.x;
     const int pp = c * 16, tile = pp / 128, t = (pp % 128) / 16, dg = tile % (Dv / 16), rest = tile / (Dv / 16);
     const int half = rest & 1, nk = (rest >> 1) & (NKB - 1), gt = (rest >> (1 + NK_BITS)) & 1;
     const int key = nk * 32 + gt * 4 + half * 16 + (t / 4) * 8 + (t % 4);
-    HK8_192_GLD16(g + (size_t)key * Dv + dg * 16, sm.data + c * 16);
+    HK8_192_GLD16(g + (size_t)key * seq_stride + dg * 16, sm.data + c * 16);
 }
 
-__device__ __forceinline__ void prefetch_k(st_k &sm, const unsigned char *g) {
-    prefetch_k_pass<0>(sm, g);
-    prefetch_k_pass<1>(sm, g);
+__device__ __forceinline__ void prefetch_k(st_k &sm, const unsigned char *g, int seq_stride = D) {
+    prefetch_k_pass<0>(sm, g, seq_stride);
+    prefetch_k_pass<1>(sm, g, seq_stride);
 }
 
-__device__ __forceinline__ void load_q8(q8_tile192 &dst, const unsigned char *g) {
+__device__ __forceinline__ void load_q8(q8_tile192 &dst, const unsigned char *g, int seq_stride = D) {
     const int c32 = laneid() & 31, gb = laneid() >> 5;
-    dst.d0 = load32(g + (size_t)c32 * D + 0 * 64 + gb * 32);
-    dst.d1 = load32(g + (size_t)c32 * D + 1 * 64 + gb * 32);
-    dst.d2 = load32(g + (size_t)c32 * D + 2 * 64 + gb * 32);
+    dst.d0 = load32(g + (size_t)c32 * seq_stride + 0 * 64 + gb * 32);
+    dst.d1 = load32(g + (size_t)c32 * seq_stride + 1 * 64 + gb * 32);
+    dst.d2 = load32(g + (size_t)c32 * seq_stride + 2 * 64 + gb * 32);
 }
 
 __device__ __forceinline__ uint32_t k_off(uint32_t kbase, int ds) {
@@ -157,8 +157,9 @@ __device__ __forceinline__ float col_sum2(const s2_tile &s) {
     return t + __shfl_xor(t, 32);
 }
 
-__device__ __forceinline__ void store_o_fp8(float *O, int q_base, int M, const o_tile &o, float l_) {
-    hk8::store_o_fp8(O, q_base, M, o, l_);
+__device__ __forceinline__ void store_o_fp8(float *O, int q_base, int M, const o_tile &o, float l_,
+                                           int seq_stride = Dv) {
+    hk8::store_o_fp8(O, q_base, M, o, l_, seq_stride);
 }
 
 #undef HK8_192_GLD16

@@ -80,7 +80,7 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase
     l_ = l_ * corr + col_sum2(s);
 }
 
-template <bool PairHeads>
+template <bool PairHeads, bool Bshd>
 __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, const unsigned char *K,
                                                     const unsigned char *V, float *O, float *Lse, int M, int N, int Hq,
                                                     int Hkv, float scale, int nxcd) {
@@ -88,6 +88,10 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
     Smem &s = sm[0];
 
     constexpr int D = 192, Dv = 128;
+    const int q_stride = Bshd ? Hq * D : D;
+    const int k_stride = Bshd ? Hkv * D : D;
+    const int v_stride = Bshd ? Hkv * Dv : Dv;
+    const int o_stride = Bshd ? Hq * Dv : Dv;
     const int GROUP = Hq / Hkv;
     constexpr int QW = PairHeads ? (NW / 2) : NW;
     const int numQ = (M / Q_BLOCK + QW - 1) / QW;
@@ -119,10 +123,19 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         qwarp = warpid();
     }
 
-    const unsigned char *Qh = Q + ((size_t)batch_idx * Hq + head_idx) * M * D;
-    const unsigned char *Kh = K + ((size_t)batch_idx * Hkv + head_kv) * N * D;
-    const unsigned char *Vh = V + ((size_t)batch_idx * Hkv + head_kv) * N * Dv;
-    float *Oh = O + ((size_t)batch_idx * Hq + head_idx) * M * Dv;
+    const unsigned char *Qh, *Kh, *Vh;
+    float *Oh;
+    if constexpr (Bshd) {
+        Qh = Q + ((size_t)batch_idx * M * Hq + (size_t)head_idx) * D;
+        Kh = K + ((size_t)batch_idx * N * Hkv + (size_t)head_kv) * D;
+        Vh = V + ((size_t)batch_idx * N * Hkv + (size_t)head_kv) * Dv;
+        Oh = O + ((size_t)batch_idx * M * Hq + (size_t)head_idx) * Dv;
+    } else {
+        Qh = Q + ((size_t)batch_idx * Hq + head_idx) * M * D;
+        Kh = K + ((size_t)batch_idx * Hkv + head_kv) * N * D;
+        Vh = V + ((size_t)batch_idx * Hkv + head_kv) * N * Dv;
+        Oh = O + ((size_t)batch_idx * Hq + head_idx) * M * Dv;
+    }
     float *Lh = Lse ? Lse + ((size_t)batch_idx * Hq + head_idx) * M : nullptr;
 
     const int num_tiles = N / KV_BLOCK;
@@ -143,14 +156,14 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         q8_tile192 qT;
         o_tile oR;
         zero_o(oR);
-        load_q8(qT, Qh + (size_t)tile_idx * Q_BLOCK * D);
+        load_q8(qT, Qh + (size_t)tile_idx * Q_BLOCK * q_stride, q_stride);
         pin_q192(qT);
         float m_ = neg_inf(), l_ = 0.f;
 
         if (pp)
             wg_bar();
-        prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, D));
-        prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, Dv));
+        prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, k_stride), k_stride);
+        prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, v_stride), v_stride);
 
         for (int kb = 0; kb < max_num_tiles; ++kb) {
             const int cur = kb & 1, nx = cur ^ 1;
@@ -162,14 +175,14 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             const uint32_t kbase = lds_u32(s.k[cur].data);
             const uint32_t vbase = lds_u32(s.v[cur].data);
             const int kb_n = (kb + 1 < max_num_tiles) ? kb + 1 : kb;
-            const unsigned char *gKn = kv_tile_ptr(Kh, kb_n, D);
-            const unsigned char *gVn = kv_tile_ptr(Vh, kb_n, Dv);
+            const unsigned char *gKn = kv_tile_ptr(Kh, kb_n, k_stride);
+            const unsigned char *gVn = kv_tile_ptr(Vh, kb_n, v_stride);
             s2_tile att;
-            prefetch_k_pass<0>(s.k[nx], gKn);
+            prefetch_k_pass<0>(s.k[nx], gKn, k_stride);
             mma_qk_pair<false>(att, k_off(kbase, 0), qT.d0);
-            prefetch_k_pass<1>(s.k[nx], gKn);
+            prefetch_k_pass<1>(s.k[nx], gKn, k_stride);
             mma_qk_pair<true>(att, k_off(kbase, 1), qT.d1);
-            prefetch_v(s.v[nx], gVn);
+            prefetch_v(s.v[nx], gVn, v_stride);
             mma_qk_pair<true>(att, k_off(kbase, 2), qT.d2);
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s2(att, q_start, kb);
@@ -177,7 +190,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             softmax_pv(oR, att, vbase, scale, m_, l_);
         }
 
-        store_o_fp8(Oh, q_start, M, oR, l_);
+        store_o_fp8(Oh, q_start, M, oR, l_, o_stride);
         if (Lh) {
             const float lse = m_ * LN2 + logf(l_);
             store_lse(Lh, q_start, M, lse);
@@ -186,7 +199,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
 }
 
 static void run(const unsigned char *Q, const unsigned char *K, const unsigned char *V, float *O, float *Lse, int M,
-                int N, int B, int Hq, int Hkv, float scale, hipStream_t stream) {
+                int N, int B, int Hq, int Hkv, float scale, bool bshd, hipStream_t stream) {
     const int GROUP = Hq / Hkv;
     const bool pair_heads = GROUP >= 2 && (GROUP & 1) == 0;
     const int q_waves = pair_heads ? (NW / 2) : NW;
@@ -194,29 +207,50 @@ static void run(const unsigned char *Q, const unsigned char *K, const unsigned c
     const int nq_pairs = (numQ + 1) / 2;
     const int nxcd = fmha_num_xcds();
     const size_t smem = sizeof(Smem);
-    if (pair_heads) {
-        hipFuncSetAttribute((const void *)attend_ker<true>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
-        attend_ker<true><<<nq_pairs * B * (Hq / 2), NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    const int nheads = pair_heads ? (Hq / 2) : Hq;
+    if (pair_heads && bshd) {
+        hipFuncSetAttribute((const void *)attend_ker<true, true>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+        attend_ker<true, true>
+            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    } else if (pair_heads) {
+        hipFuncSetAttribute((const void *)attend_ker<true, false>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+        attend_ker<true, false>
+            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    } else if (bshd) {
+        hipFuncSetAttribute((const void *)attend_ker<false, true>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+        attend_ker<false, true>
+            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
     } else {
-        hipFuncSetAttribute((const void *)attend_ker<false>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
-        attend_ker<false><<<nq_pairs * B * Hq, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+        hipFuncSetAttribute((const void *)attend_ker<false, false>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+        attend_ker<false, false>
+            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
     }
 }
 
-std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale,
-                                              bool causal, bool return_lse) {
+std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, bool causal,
+                                              bool return_lse, bool bshd) {
     TORCH_CHECK(causal, "fmha_fp8_d192 is causal-only");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
     TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fn, "fmha_fp8_d192 needs float8_e4m3fn");
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q,k,v must be [B,H,S,D]");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+                bshd ? "q,k,v must be BSHD [B,S,H,D]" : "q,k,v must be BHSD [B,H,S,D]");
     q = q.contiguous();
     k = k.contiguous();
     v = v.contiguous();
-    const int B = q.size(0), Hq = q.size(1), M = q.size(2), D = q.size(3);
-    const int Hkv = k.size(1), N = k.size(2), Dv = v.size(3);
+    const int B = q.size(0), D = q.size(3), Dv = v.size(3);
+    const int Hq = bshd ? q.size(2) : q.size(1);
+    const int M = bshd ? q.size(1) : q.size(2);
+    const int Hkv = bshd ? k.size(2) : k.size(1);
+    const int N = bshd ? k.size(1) : k.size(2);
     TORCH_CHECK(D == 192 && Dv == 128 && M % 256 == 0 && N % 64 == 0);
-    TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && v.size(1) == Hkv && v.size(2) == N);
-    auto O = torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kFloat));
+    TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
+    if (bshd) {
+        TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);
+    } else {
+        TORCH_CHECK(v.size(1) == Hkv && v.size(2) == N);
+    }
+    auto O = bshd ? torch::empty({B, M, Hq, Dv}, q.options().dtype(at::kFloat))
+                  : torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kFloat));
     torch::Tensor Lse;
     float *Lp = nullptr;
     if (return_lse) {
@@ -224,7 +258,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
         Lp = Lse.data_ptr<float>();
     }
     run((const unsigned char *)q.data_ptr(), (const unsigned char *)k.data_ptr(),
-        (const unsigned char *)v.data_ptr(), O.data_ptr<float>(), Lp, M, N, B, Hq, Hkv, (float)scale * L2E,
+        (const unsigned char *)v.data_ptr(), O.data_ptr<float>(), Lp, M, N, B, Hq, Hkv, (float)scale * L2E, bshd,
         at::cuda::getCurrentCUDAStream());
     if (return_lse)
         return {O, Lse};
