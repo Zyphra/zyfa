@@ -36,6 +36,66 @@ __device__ __forceinline__ fx16 mfma16(v8b a, v8b b, fx16 c) {
 #endif
 constexpr float RESCALE_THRESHOLD = 8.f;
 
+// llvm.amdgcn.sched.barrier / sched.group.barrier (AMDGPUUsage).
+constexpr int MFMA_MASK = 0x08;
+constexpr int VALU_MASK = 0x02;
+constexpr int VMEM_MASK = 0x10; // includes LDSDMA (buffer_load … lds)
+constexpr int EXP_MASK = 0x400;
+
+#define SCHED_GROUP(mask, cnt, id) __builtin_amdgcn_sched_group_barrier(mask, cnt, id)
+#define SCHED_FENCE() __builtin_amdgcn_sched_barrier(0)
+
+template <int Pairs, int OtherCnt, int OtherMask, int Id>
+__device__ __forceinline__ void sched_mfma_pairs() {
+    SCHED_GROUP(MFMA_MASK, 1, Id);
+    SCHED_GROUP(OtherMask, OtherCnt, Id);
+    if constexpr (Pairs > 1)
+        sched_mfma_pairs<Pairs - 1, OtherCnt, OtherMask, Id>();
+}
+
+template <int Pairs, int ValuCnt, int Id>
+__device__ __forceinline__ void sched_valu_pairs() {
+    sched_mfma_pairs<Pairs, ValuCnt, VALU_MASK, Id>();
+}
+
+template <int Pairs, int ExpCnt, int Id>
+__device__ __forceinline__ void sched_exp_pairs() {
+    sched_mfma_pairs<Pairs, ExpCnt, EXP_MASK, Id>();
+}
+
+template <int Pairs, int MfmaCnt, int Id>
+__device__ __forceinline__ void sched_vmem_mfma() {
+    SCHED_GROUP(VMEM_MASK, 1, Id);
+    SCHED_GROUP(MFMA_MASK, MfmaCnt, Id);
+    if constexpr (Pairs > 1)
+        sched_vmem_mfma<Pairs - 1, MfmaCnt, Id>();
+}
+
+// HK/aiter G2S: buffer_load_dwordx4 … lds (SGPR rsrc + 32-bit voffset).
+using g2s_i32x4 = int32_t __attribute__((ext_vector_type(4)));
+using g2s_as3 = uint32_t __attribute__((address_space(3))) *;
+
+struct g2s_rsrc {
+    uint64_t ptr;
+    uint32_t range;
+    uint32_t config;
+};
+
+__device__ __forceinline__ g2s_i32x4 make_srsrc(const void *ptr, uint32_t range_bytes) {
+    g2s_rsrc r{reinterpret_cast<uint64_t>(ptr), range_bytes, 0x110000u};
+    g2s_i32x4 out;
+    __builtin_memcpy(&out, &r, 16);
+    return out;
+}
+
+extern "C" __device__ void llvm_amdgcn_raw_buffer_load_lds(g2s_i32x4 rsrc, g2s_as3 lds_ptr, int size, int voffset,
+                                                          int soffset, int offset, int aux)
+    __asm("llvm.amdgcn.raw.buffer.load.lds");
+
+__device__ __forceinline__ void g2s16(const void *gbase, void *lds, uint32_t voff, uint32_t range) {
+    llvm_amdgcn_raw_buffer_load_lds(make_srsrc(gbase, range), (g2s_as3)(uintptr_t)lds, 16, (int)voff, 0, 0, 0);
+}
+
 __device__ __forceinline__ int rv_all_below(float prev, float cur, float T = RESCALE_THRESHOLD) {
     return (cur - prev <= T);
 }

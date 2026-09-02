@@ -35,10 +35,6 @@ struct s2_tile {
 __device__ __forceinline__ void pin_q192(q8_tile192 &t) { asm volatile("" : "+v"(t.d0), "+v"(t.d1), "+v"(t.d2)); }
 __device__ __forceinline__ void pin_s2(s2_tile &t) { asm volatile("" : "+v"(t.a), "+v"(t.b)); }
 
-#define HK8_192_GLD16(g, l)                                                                                            \
-    __builtin_amdgcn_global_load_lds((const __attribute__((address_space(1))) void *)(g),                              \
-                                     (__attribute__((address_space(3))) void *)(l), 16, 0, 0)
-
 struct alignas(16) st_k {
     unsigned char data[KN * KSTRIDE];
 };
@@ -53,7 +49,8 @@ __device__ __forceinline__ void prefetch_k_pass(st_k &sm, const unsigned char *g
     const int P = chunk >> 1, r = (chunk & 1) * 16;
     const int L = (P - key) & (CPR - 1);
     const int Ls = (L < 6) ? L : 0;
-    HK8_192_GLD16(g + (size_t)key * seq_stride + Ls * 32 + r, sm.data + c * 16);
+    const uint32_t range = (uint32_t)KN * (uint32_t)seq_stride;
+    g2s16(g, sm.data + c * 16, (uint32_t)((size_t)key * seq_stride + Ls * 32 + r), range);
 }
 
 __device__ __forceinline__ void prefetch_v(st_v &sm, const unsigned char *g, int seq_stride = Dv) {
@@ -62,7 +59,8 @@ __device__ __forceinline__ void prefetch_v(st_v &sm, const unsigned char *g, int
     const int pp = c * 16, tile = pp / 128, t = (pp % 128) / 16, dg = tile % (Dv / 16), rest = tile / (Dv / 16);
     const int half = rest & 1, nk = (rest >> 1) & (NKB - 1), gt = (rest >> (1 + NK_BITS)) & 1;
     const int key = nk * 32 + gt * 4 + half * 16 + (t / 4) * 8 + (t % 4);
-    HK8_192_GLD16(g + (size_t)key * seq_stride + dg * 16, sm.data + c * 16);
+    const uint32_t range = (uint32_t)KN * (uint32_t)seq_stride;
+    g2s16(g, sm.data + c * 16, (uint32_t)((size_t)key * seq_stride + dg * 16), range);
 }
 
 __device__ __forceinline__ void prefetch_k(st_k &sm, const unsigned char *g, int seq_stride = D) {

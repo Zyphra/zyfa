@@ -76,7 +76,10 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase
     __builtin_amdgcn_s_setprio(1);
     hk8::exp2_sc(s.b, scale, mref);
     mma_pv_lds(o, vbase, pack_p(s.a, s.b));
+    sched_exp_pairs<4, 3, 1>();
+    sched_valu_pairs<2, 5, 1>();
     __builtin_amdgcn_s_setprio(0);
+    SCHED_FENCE();
     l_ = l_ * corr + col_sum2(s);
 }
 
@@ -164,6 +167,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             wg_bar();
         prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, k_stride), k_stride);
         prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, v_stride), v_stride);
+        SCHED_FENCE();
 
         for (int kb = 0; kb < max_num_tiles; ++kb) {
             const int cur = kb & 1, nx = cur ^ 1;
@@ -171,7 +175,9 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
                 asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             else
                 asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
+            SCHED_FENCE();
             wg_bar();
+            SCHED_FENCE();
             const uint32_t kbase = lds_u32(s.k[cur].data);
             const uint32_t vbase = lds_u32(s.v[cur].data);
             const int kb_n = (kb + 1 < max_num_tiles) ? kb + 1 : kb;
@@ -184,6 +190,8 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             mma_qk_pair<true>(att, k_off(kbase, 1), qT.d1);
             prefetch_v(s.v[nx], gVn, v_stride);
             mma_qk_pair<true>(att, k_off(kbase, 2), qT.d2);
+            sched_vmem_mfma<3, 2, 0>();
+            SCHED_FENCE();
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s2(att, q_start, kb);
 

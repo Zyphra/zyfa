@@ -41,9 +41,7 @@ __device__ __forceinline__ float max3(float a, float b, float c) {
     return r;
 }
 
-#define HK8_GLD16(g, l) __builtin_amdgcn_global_load_lds(                                           \
-    (const __attribute__((address_space(1))) void *)(g),                                           \
-    (__attribute__((address_space(3))) void *)(l), 16, 0, 0)
+// G2S via hk::g2s16 (buffer_load … lds).
 
 struct alignas(16) st8 {
     unsigned char data[KN * D];
@@ -129,7 +127,8 @@ __device__ __forceinline__ void prefetch_k_pass(st8 &sm, const unsigned char *g,
     const int off16 = (c % (D / 16)) * 16;
     const int P = off16 / 32, r = off16 % 32;
     const int L = (P - key) & 3;
-    HK8_GLD16(g + (size_t)key * seq_stride + L * 32 + r, sm.data + key * D + P * 32 + r);
+    const uint32_t range = (uint32_t)KN * (uint32_t)seq_stride;
+    g2s16(g, sm.data + key * D + P * 32 + r, (uint32_t)((size_t)key * seq_stride + L * 32 + r), range);
 }
 
 template <int Pass>
@@ -140,7 +139,8 @@ __device__ __forceinline__ void prefetch_v_pass(st8 &sm, const unsigned char *g,
               rest = tile / (Dv / 16);
     const int half = rest & 1, nk = (rest >> 1) & (NKB - 1), gt = (rest >> (1 + NK_BITS)) & 1;
     const int key = nk * 32 + gt * 4 + half * 16 + (t / 4) * 8 + (t % 4);
-    HK8_GLD16(g + (size_t)key * seq_stride + dg * 16, sm.data + c * 16);
+    const uint32_t range = (uint32_t)KN * (uint32_t)seq_stride;
+    g2s16(g, sm.data + c * 16, (uint32_t)((size_t)key * seq_stride + dg * 16), range);
 }
 
 __device__ __forceinline__ void prefetch_k(st8 &sm, const unsigned char *g, int seq_stride = D) {

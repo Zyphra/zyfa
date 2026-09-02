@@ -28,10 +28,6 @@ __device__ __forceinline__ float max3(float a, float b, float c) {
     return r;
 }
 
-#define HK192_GLD16(g, l)                                                                                              \
-    __builtin_amdgcn_global_load_lds((const __attribute__((address_space(1))) void *)(g),                              \
-                                     (__attribute__((address_space(3))) void *)(l), 16, 0, 0)
-
 struct alignas(16) st_k {
     bf16 data[KN * KSTRIDE_BF16];
 };
@@ -45,7 +41,8 @@ __device__ __forceinline__ void prefetch_k_pass(st_k &sm, const bf16 *g, int seq
     const int key = c / CPR, P = c % CPR;
     const int L = (P - key) & (CPR - 1);
     const int Ls = (L < 24) ? L : 0;
-    HK192_GLD16(g + (size_t)key * seq_stride + Ls * 8, sm.data + c * 8);
+    const uint32_t range = (uint32_t)KN * (uint32_t)seq_stride * (uint32_t)sizeof(bf16);
+    g2s16(g, sm.data + c * 8, (uint32_t)(((size_t)key * seq_stride + Ls * 8) * sizeof(bf16)), range);
 }
 
 template <int Pass>
@@ -54,7 +51,8 @@ __device__ __forceinline__ void prefetch_v_pass(st_v &sm, const bf16 *g, int seq
     const int pp = c * 8, tl = pp / 64, wi = pp % 64;
     const int ky = (tl / (Dv / 16)) * 4 + wi / 16;
     const int dvv = (tl % (Dv / 16)) * 16 + wi % 16;
-    HK192_GLD16(g + (size_t)ky * seq_stride + dvv, sm.data + c * 8);
+    const uint32_t range = (uint32_t)KN * (uint32_t)seq_stride * (uint32_t)sizeof(bf16);
+    g2s16(g, sm.data + c * 8, (uint32_t)(((size_t)ky * seq_stride + dvv) * sizeof(bf16)), range);
 }
 
 __device__ __forceinline__ void prefetch_k(st_k &sm, const bf16 *g, int seq_stride = D) {

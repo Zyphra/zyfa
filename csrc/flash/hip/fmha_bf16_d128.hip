@@ -88,7 +88,13 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, const st16 &vs
     p.d = cvt8(s.d, 8);
     mma_pv_sl<2>(o, vhi, p);
     mma_pv_sl<3>(o, vhi, p);
+    // PV MFMA (32) + exp2 of the next P half + cvt VALU. Same pairing HK uses
+    // when softmax shares a region with MMA; here the independent halves are
+    // s.b/s.c/s.d vs the PV of the previous half.
+    sched_exp_pairs<8, 3, 1>();
+    sched_valu_pairs<8, 5, 1>();
     __builtin_amdgcn_s_setprio(0);
+    SCHED_FENCE();
     l_ = l_ * corr + col_sum4(s);
 }
 
@@ -176,6 +182,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
             wg_bar();
         prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, kv_stride), kv_stride);
         prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, kv_stride), kv_stride);
+        SCHED_FENCE();
 
         for (int kb = 0; kb < max_num_tiles; ++kb) {
             const int cur = kb & 1, nx = cur ^ 1;
@@ -183,7 +190,9 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
                 asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             else
                 asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
+            SCHED_FENCE();
             wg_bar();
+            SCHED_FENCE();
             uint32_t kbase = lds_u32(s.k[cur].data);
             asm volatile("" : "+v"(kbase));
             const int kb_n = (kb + 1 < max_num_tiles) ? kb + 1 : kb;
@@ -208,6 +217,9 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
             prefetch_v_pass<2>(s.v[nx], gVn, kv_stride);
             mma_qk_quad(att, k_off(kbase, 7), qT.d7);
             prefetch_v_pass<3>(s.v[nx], gVn, kv_stride);
+            // 8 G2S + 32 QK MFMA in the preceding region: 1 VMEM then 4 MFMA.
+            sched_vmem_mfma<8, 4, 0>();
+            SCHED_FENCE();
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s4(att, q_start, kb);
             softmax_pv(oR, att, s.v[cur], m_, l_);
