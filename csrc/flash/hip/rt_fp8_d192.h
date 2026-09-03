@@ -21,6 +21,9 @@ using hk8::load32;
 using hk8::lds_u32;
 using hk8::fmha_qoff;
 using hk8::max3;
+using hk8::xor32_max;
+using hk8::xor32_sum;
+using hk8::f2;
 
 constexpr int KN = 64, D = 192, Dv = 128, CPR = 8, KSTRIDE = 256, NKB = 2, NDVB = 4;
 
@@ -32,8 +35,8 @@ struct s2_tile {
     fx16 a, b;
 };
 
-__device__ __forceinline__ void pin_q192(q8_tile192 &t) { asm volatile("" : "+v"(t.d0), "+v"(t.d1), "+v"(t.d2)); }
-__device__ __forceinline__ void pin_s2(s2_tile &t) { asm volatile("" : "+v"(t.a), "+v"(t.b)); }
+__device__ __forceinline__ void pin_q192(q8_tile192 &) {}
+__device__ __forceinline__ void pin_s2(s2_tile &) {}
 
 struct alignas(16) st_k {
     unsigned char data[KN * KSTRIDE];
@@ -50,7 +53,8 @@ __device__ __forceinline__ void prefetch_k_pass(st_k &sm, const unsigned char *g
     const int L = (P - key) & (CPR - 1);
     const int Ls = (L < 6) ? L : 0;
     const uint32_t range = (uint32_t)KN * (uint32_t)seq_stride;
-    g2s16(g, sm.data + c * 16, (uint32_t)((size_t)key * seq_stride + Ls * 32 + r), range);
+    const uint32_t voff = (uint32_t)key * (uint32_t)seq_stride + (uint32_t)Ls * 32u + (uint32_t)r;
+    g2s16(g, sm.data + c * 16, voff, range);
 }
 
 __device__ __forceinline__ void prefetch_v(st_v &sm, const unsigned char *g, int seq_stride = Dv) {
@@ -60,7 +64,8 @@ __device__ __forceinline__ void prefetch_v(st_v &sm, const unsigned char *g, int
     const int half = rest & 1, nk = (rest >> 1) & (NKB - 1), gt = (rest >> (1 + NK_BITS)) & 1;
     const int key = nk * 32 + gt * 4 + half * 16 + (t / 4) * 8 + (t % 4);
     const uint32_t range = (uint32_t)KN * (uint32_t)seq_stride;
-    g2s16(g, sm.data + c * 16, (uint32_t)((size_t)key * seq_stride + dg * 16), range);
+    const uint32_t voff = (uint32_t)key * (uint32_t)seq_stride + (uint32_t)dg * 16u;
+    g2s16(g, sm.data + c * 16, voff, range);
 }
 
 __device__ __forceinline__ void prefetch_k(st_k &sm, const unsigned char *g, int seq_stride = D) {
@@ -136,8 +141,10 @@ __device__ __forceinline__ void mask_s2(s2_tile &s, int q_start, int kb) {
     const int k_base = kb * KN;
     const int rb = ((laneid() >> 5) << 2);
     const float ninf = neg_inf();
-    s.a = mask_half(s.a, rb, q_pos, k_base + 0, ninf);
-    s.b = mask_half(s.b, rb, q_pos, k_base + 32, ninf);
+    if (k_base + 0 + 31 > q_start)
+        s.a = mask_half(s.a, rb, q_pos, k_base + 0, ninf);
+    if (k_base + 32 + 31 > q_start)
+        s.b = mask_half(s.b, rb, q_pos, k_base + 32, ninf);
 }
 
 __device__ __forceinline__ float col_max2_sc(const s2_tile &s, float scale) {
@@ -147,12 +154,18 @@ __device__ __forceinline__ float col_max2_sc(const s2_tile &s, float scale) {
 #pragma unroll
     for (int r = 0; r < 16; ++r)
         mx = max3(s.a[r], s.b[r], mx);
-    return fmaxf(mx, __shfl_xor(mx, 32)) * scale;
+    return xor32_max(mx) * scale;
 }
 
 __device__ __forceinline__ float col_sum2(const s2_tile &s) {
-    float t = _fx_sum(s.b, _fx_sum(s.a, 0.f));
-    return t + __shfl_xor(t, 32);
+    f2 acc = {0.f, 0.f};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const f2 a = {s.a[2 * i], s.a[2 * i + 1]};
+        const f2 b = {s.b[2 * i], s.b[2 * i + 1]};
+        acc += a + b;
+    }
+    return xor32_sum(acc[0] + acc[1]);
 }
 
 __device__ __forceinline__ void store_o_fp8(float *O, int q_base, int M, const o_tile &o, float l_,

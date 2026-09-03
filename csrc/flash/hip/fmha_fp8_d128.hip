@@ -73,6 +73,7 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     m_ = mnew;
 #endif
     pv_v_head vh = preissue_pv_v(vbase, 0);
+    __builtin_amdgcn_iglp_opt(2);
     exp2_sc(s.a, scale, mref);
     exp2_sc(s.b, scale, mref);
     __builtin_amdgcn_s_setprio(1);
@@ -80,10 +81,7 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     exp2_sc(s.c, scale, mref);
     exp2_sc(s.d, scale, mref);
     mma_pv_lds(o, vbase, pack_p(s.c, s.d), 2);
-    sched_exp_pairs<4, 3, 1>();
-    sched_valu_pairs<4, 5, 1>();
     __builtin_amdgcn_s_setprio(0);
-    SCHED_FENCE();
     l_ = l_ * corr + col_sum4(s);
 }
 
@@ -168,17 +166,10 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             wg_bar();
         prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, kv_stride), kv_stride);
         prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, kv_stride), kv_stride);
-        SCHED_FENCE();
 
         for (int kb = 0; kb < max_num_tiles; ++kb) {
             const int cur = kb & 1, nx = cur ^ 1;
-            if (kb == 0)
-                asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-            else
-                asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
-            SCHED_FENCE();
             wg_bar();
-            SCHED_FENCE();
             const uint32_t kbase = lds_u32(s.k[cur].data);
             const uint32_t vbase = lds_u32(s.v[cur].data);
             const int kb_n = (kb + 1 < max_num_tiles) ? kb + 1 : kb;
@@ -186,6 +177,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             const unsigned char *gVn = kv_tile_ptr(Vh, kb_n, kv_stride);
             s4_tile att;
             const uint32_t off0 = k_off(kbase, 0), off1 = k_off(kbase, 1);
+            __builtin_amdgcn_iglp_opt(0);
             prefetch_k_pass<0>(s.k[nx], gKn, kv_stride);
             mma_qk_pair<false>(att, off0, qT.d0, 0);
             prefetch_k_pass<1>(s.k[nx], gKn, kv_stride);
@@ -194,8 +186,6 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             mma_qk_pair<true>(att, off1, qT.d1, 0);
             prefetch_v_pass<1>(s.v[nx], gVn, kv_stride);
             mma_qk_pair<true>(att, off1, qT.d1, 2);
-            sched_vmem_mfma<4, 2, 0>();
-            SCHED_FENCE();
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s4(att, q_start, kb);
 

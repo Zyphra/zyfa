@@ -35,10 +35,20 @@ __device__ __forceinline__ fx16 kh_mma0(i32x8 a, i32x8 b) {
     return o;
 }
 
-__device__ __forceinline__ float max3(float a, float b, float c) {
-    float r;
-    asm volatile("v_max3_f32 %0, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "v"(c));
-    return r;
+// Compiler still emits v_max3_f32; the read is visible to the hazard recogniser.
+__device__ __forceinline__ float max3(float a, float b, float c) { return fmaxf(fmaxf(a, b), c); }
+
+// gfx950: two copies of x → {[lo,lo],[hi,hi]}. Builtin only — inline asm nans.
+typedef int _v2i __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ float xor32_max(float x) {
+    const int xi = __float_as_int(x);
+    const _v2i r = __builtin_amdgcn_permlane32_swap(xi, xi, false, false);
+    return fmaxf(__int_as_float(r[0]), __int_as_float(r[1]));
+}
+__device__ __forceinline__ float xor32_sum(float x) {
+    const int xi = __float_as_int(x);
+    const _v2i r = __builtin_amdgcn_permlane32_swap(xi, xi, false, false);
+    return __int_as_float(r[0]) + __int_as_float(r[1]);
 }
 
 // G2S via hk::g2s16 (buffer_load … lds).
@@ -56,8 +66,8 @@ struct s4_tile {
     fx16 a, b, c, d;
 };
 
-__device__ __forceinline__ void pin_q8(q8_tile &t) { asm volatile("" : "+v"(t.d0), "+v"(t.d1)); }
-__device__ __forceinline__ void pin_s4(s4_tile &t) { asm volatile("" : "+v"(t.a), "+v"(t.b), "+v"(t.c), "+v"(t.d)); }
+__device__ __forceinline__ void pin_q8(q8_tile &) {}
+__device__ __forceinline__ void pin_s4(s4_tile &) {}
 
 __device__ __forceinline__ int fmha_qoff(int r, int g) { return (r / 4) * 8 + g * 4 + (r % 4); }
 
@@ -128,7 +138,8 @@ __device__ __forceinline__ void prefetch_k_pass(st8 &sm, const unsigned char *g,
     const int P = off16 / 32, r = off16 % 32;
     const int L = (P - key) & 3;
     const uint32_t range = (uint32_t)KN * (uint32_t)seq_stride;
-    g2s16(g, sm.data + key * D + P * 32 + r, (uint32_t)((size_t)key * seq_stride + L * 32 + r), range);
+    const uint32_t voff = (uint32_t)key * (uint32_t)seq_stride + (uint32_t)L * 32u + (uint32_t)r;
+    g2s16(g, sm.data + key * D + P * 32 + r, voff, range);
 }
 
 template <int Pass>
@@ -140,7 +151,8 @@ __device__ __forceinline__ void prefetch_v_pass(st8 &sm, const unsigned char *g,
     const int half = rest & 1, nk = (rest >> 1) & (NKB - 1), gt = (rest >> (1 + NK_BITS)) & 1;
     const int key = nk * 32 + gt * 4 + half * 16 + (t / 4) * 8 + (t % 4);
     const uint32_t range = (uint32_t)KN * (uint32_t)seq_stride;
-    g2s16(g, sm.data + c * 16, (uint32_t)((size_t)key * seq_stride + dg * 16), range);
+    const uint32_t voff = (uint32_t)key * (uint32_t)seq_stride + (uint32_t)dg * 16u;
+    g2s16(g, sm.data + c * 16, voff, range);
 }
 
 __device__ __forceinline__ void prefetch_k(st8 &sm, const unsigned char *g, int seq_stride = D) {
@@ -261,10 +273,14 @@ __device__ __forceinline__ void mask_s4(s4_tile &s, int q_start, int kb) {
     const int k_base = kb * KN;
     const int rb = ((laneid() >> 5) << 2);
     const float ninf = neg_inf();
-    s.a = mask_half(s.a, rb, q_pos, k_base + 0, ninf);
-    s.b = mask_half(s.b, rb, q_pos, k_base + 32, ninf);
-    s.c = mask_half(s.c, rb, q_pos, k_base + 64, ninf);
-    s.d = mask_half(s.d, rb, q_pos, k_base + 96, ninf);
+    if (k_base + 0 + 31 > q_start)
+        s.a = mask_half(s.a, rb, q_pos, k_base + 0, ninf);
+    if (k_base + 32 + 31 > q_start)
+        s.b = mask_half(s.b, rb, q_pos, k_base + 32, ninf);
+    if (k_base + 64 + 31 > q_start)
+        s.c = mask_half(s.c, rb, q_pos, k_base + 64, ninf);
+    if (k_base + 96 + 31 > q_start)
+        s.d = mask_half(s.d, rb, q_pos, k_base + 96, ninf);
 }
 
 __device__ __forceinline__ float col_max4_sc(const s4_tile &s, float scale) {
@@ -275,7 +291,7 @@ __device__ __forceinline__ float col_max4_sc(const s4_tile &s, float scale) {
 #pragma unroll
     for (int r = 0; r < 16; ++r)
         mx = max3(max3(s.a[r], s.b[r], s.c[r]), s.d[r], mx);
-    return fmaxf(mx, __shfl_xor(mx, 32)) * scale;
+    return xor32_max(mx) * scale;
 }
 
 // Causal tiles always contain at least one unmasked key for every query row,
@@ -294,8 +310,16 @@ __device__ __forceinline__ void exp2_sc(fx16 &s, float scale, float mnew) {
 }
 
 __device__ __forceinline__ float col_sum4(const s4_tile &s) {
-    float t = _fx_sum(s.d, _fx_sum(s.c, _fx_sum(s.b, _fx_sum(s.a, 0.f))));
-    return t + __shfl_xor(t, 32);
+    f2 acc = {0.f, 0.f};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const f2 a = {s.a[2 * i], s.a[2 * i + 1]};
+        const f2 b = {s.b[2 * i], s.b[2 * i + 1]};
+        const f2 c = {s.c[2 * i], s.c[2 * i + 1]};
+        const f2 d = {s.d[2 * i], s.d[2 * i + 1]};
+        acc += (a + b) + (c + d);
+    }
+    return xor32_sum(acc[0] + acc[1]);
 }
 
 __device__ __forceinline__ void sub_s4(s4_tile &s, float m) {

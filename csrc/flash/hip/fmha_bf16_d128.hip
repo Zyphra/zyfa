@@ -66,35 +66,25 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, const st16 &vs
 #endif
     const auto &vlo = *reinterpret_cast<const st<64, 128> *>(&vsm.data[0]);
     const auto &vhi = *reinterpret_cast<const st<64, 128> *>(&vsm.data[64 * Dv]);
-    p_tile p;
-    exp2_m(s.a, mref);
-    p.a = cvt8(s.a, 0);
-    p.b = cvt8(s.a, 8);
+    __builtin_amdgcn_iglp_opt(2);
+    exp2_h<0>(s.a, mref);
     __builtin_amdgcn_s_setprio(1);
-    mma_pv_sl<0>(o, vlo, p);
-    mma_pv_sl<1>(o, vlo, p);
-    exp2_m(s.b, mref);
-    p.c = cvt8(s.b, 0);
-    p.d = cvt8(s.b, 8);
-    mma_pv_sl<2>(o, vlo, p);
-    mma_pv_sl<3>(o, vlo, p);
-    exp2_m(s.c, mref);
-    p.a = cvt8(s.c, 0);
-    p.b = cvt8(s.c, 8);
-    mma_pv_sl<0>(o, vhi, p);
-    mma_pv_sl<1>(o, vhi, p);
-    exp2_m(s.d, mref);
-    p.c = cvt8(s.d, 0);
-    p.d = cvt8(s.d, 8);
-    mma_pv_sl<2>(o, vhi, p);
-    mma_pv_sl<3>(o, vhi, p);
-    // PV MFMA (32) + exp2 of the next P half + cvt VALU. Same pairing HK uses
-    // when softmax shares a region with MMA; here the independent halves are
-    // s.b/s.c/s.d vs the PV of the previous half.
-    sched_exp_pairs<8, 3, 1>();
-    sched_valu_pairs<8, 5, 1>();
+    mma_pv_one<0>(o, vlo, cvt8(s.a, 0));
+    exp2_h<8>(s.a, mref);
+    mma_pv_one<1>(o, vlo, cvt8(s.a, 8));
+    exp2_h<0>(s.b, mref);
+    mma_pv_one<2>(o, vlo, cvt8(s.b, 0));
+    exp2_h<8>(s.b, mref);
+    mma_pv_one<3>(o, vlo, cvt8(s.b, 8));
+    exp2_h<0>(s.c, mref);
+    mma_pv_one<0>(o, vhi, cvt8(s.c, 0));
+    exp2_h<8>(s.c, mref);
+    mma_pv_one<1>(o, vhi, cvt8(s.c, 8));
+    exp2_h<0>(s.d, mref);
+    mma_pv_one<2>(o, vhi, cvt8(s.d, 0));
+    exp2_h<8>(s.d, mref);
+    mma_pv_one<3>(o, vhi, cvt8(s.d, 8));
     __builtin_amdgcn_s_setprio(0);
-    SCHED_FENCE();
     l_ = l_ * corr + col_sum4(s);
 }
 
@@ -182,44 +172,33 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
             wg_bar();
         prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, kv_stride), kv_stride);
         prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, kv_stride), kv_stride);
-        SCHED_FENCE();
 
         for (int kb = 0; kb < max_num_tiles; ++kb) {
             const int cur = kb & 1, nx = cur ^ 1;
-            if (kb == 0)
-                asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-            else
-                asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
-            SCHED_FENCE();
             wg_bar();
-            SCHED_FENCE();
-            uint32_t kbase = lds_u32(s.k[cur].data);
-            asm volatile("" : "+v"(kbase));
             const int kb_n = (kb + 1 < max_num_tiles) ? kb + 1 : kb;
             const bf16 *gKn = kv_tile_ptr(Kh, kb_n, kv_stride);
             const bf16 *gVn = kv_tile_ptr(Vh, kb_n, kv_stride);
             s4_tile att;
             zero_s4(att);
             pin_s4(att);
+            __builtin_amdgcn_iglp_opt(0);
             prefetch_k_pass<0>(s.k[nx], gKn, kv_stride);
-            mma_qk_quad(att, k_off(kbase, 0), qT.d0);
-            mma_qk_quad(att, k_off(kbase, 1), qT.d1);
+            mma_qk_quad_c(att, s.k[cur], 0, qT.d0);
+            mma_qk_quad_c(att, s.k[cur], 1, qT.d1);
             prefetch_k_pass<1>(s.k[nx], gKn, kv_stride);
-            mma_qk_quad(att, k_off(kbase, 2), qT.d2);
+            mma_qk_quad_c(att, s.k[cur], 2, qT.d2);
             prefetch_v_pass<0>(s.v[nx], gVn, kv_stride);
-            mma_qk_quad(att, k_off(kbase, 3), qT.d3);
+            mma_qk_quad_c(att, s.k[cur], 3, qT.d3);
             prefetch_k_pass<2>(s.k[nx], gKn, kv_stride);
-            mma_qk_quad(att, k_off(kbase, 4), qT.d4);
+            mma_qk_quad_c(att, s.k[cur], 4, qT.d4);
             prefetch_v_pass<1>(s.v[nx], gVn, kv_stride);
-            mma_qk_quad(att, k_off(kbase, 5), qT.d5);
+            mma_qk_quad_c(att, s.k[cur], 5, qT.d5);
             prefetch_k_pass<3>(s.k[nx], gKn, kv_stride);
-            mma_qk_quad(att, k_off(kbase, 6), qT.d6);
+            mma_qk_quad_c(att, s.k[cur], 6, qT.d6);
             prefetch_v_pass<2>(s.v[nx], gVn, kv_stride);
-            mma_qk_quad(att, k_off(kbase, 7), qT.d7);
+            mma_qk_quad_c(att, s.k[cur], 7, qT.d7);
             prefetch_v_pass<3>(s.v[nx], gVn, kv_stride);
-            // 8 G2S + 32 QK MFMA in the preceding region: 1 VMEM then 4 MFMA.
-            sched_vmem_mfma<8, 4, 0>();
-            SCHED_FENCE();
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s4(att, q_start, kb);
             softmax_pv(oR, att, s.v[cur], m_, l_);

@@ -170,17 +170,12 @@ __device__ __forceinline__ void copy_p(p_tile &d, const s_tile &s) {
     d.d = cvt8(s.b, 8);
 }
 
-// Keep named ext_vectors in VGPRs. LLVM otherwise memcpy's the struct to scratch.
-__device__ __forceinline__ void pin_kv(kv_tile &t) {
-    asm volatile("" : "+v"(t.d0), "+v"(t.d1), "+v"(t.d2), "+v"(t.d3), "+v"(t.d4), "+v"(t.d5), "+v"(t.d6), "+v"(t.d7),
-                          "+v"(t.d8), "+v"(t.d9), "+v"(t.d10), "+v"(t.d11), "+v"(t.d12), "+v"(t.d13), "+v"(t.d14),
-                          "+v"(t.d15));
-}
-__device__ __forceinline__ void pin_q(q_tile &t) {
-    asm volatile("" : "+v"(t.d0), "+v"(t.d1), "+v"(t.d2), "+v"(t.d3), "+v"(t.d4), "+v"(t.d5), "+v"(t.d6), "+v"(t.d7));
-}
-__device__ __forceinline__ void pin_s(s_tile &t) { asm volatile("" : "+v"(t.a), "+v"(t.b)); }
-__device__ __forceinline__ void pin_o(o_tile &t) { asm volatile("" : "+v"(t.a), "+v"(t.b), "+v"(t.c), "+v"(t.d)); }
+// Empty on ROCm 7.2 / clang 22: structs stay in VGPR; the old asm was a
+// scheduling barrier on the hottest registers.
+__device__ __forceinline__ void pin_kv(kv_tile &) {}
+__device__ __forceinline__ void pin_q(q_tile &) {}
+__device__ __forceinline__ void pin_s(s_tile &) {}
+__device__ __forceinline__ void pin_o(o_tile &) {}
 
 __device__ __forceinline__ v8b p_strip(const s_tile &s, int sl) {
     return sl == 0 ? cvt8(s.a, 0) : sl == 1 ? cvt8(s.a, 8) : sl == 2 ? cvt8(s.b, 0) : cvt8(s.b, 8);
@@ -624,6 +619,24 @@ __device__ __forceinline__ void mma_pv(o_tile &o, const st<64, 128> &sm, const p
         mma_pv_sl<2>(o, sm, p);
     else
         mma_pv_sl<3>(o, sm, p);
+}
+
+// One PV slice with the P strip by value so the caller can produce each strip
+// immediately before its MFMA. No hand-written s_waitcnt: load_v_frag is a
+// builtin, so the compiler batches the lgkmcnt drains.
+template <int SL>
+__device__ __forceinline__ void mma_pv_one(o_tile &o, const st<64, 128> &sm, v8b ps) {
+    const int lane = laneid();
+    const int row_off = ((lane % 16) / 4) + ((lane / 32) * 4);
+    const int col_off = ((lane % 4) * 4) + (16 * ((lane % 32) / 16));
+    const v8b v0 = load_v_frag(sm, SL, 0, row_off, col_off);
+    const v8b v1 = load_v_frag(sm, SL, 1, row_off, col_off);
+    const v8b v2 = load_v_frag(sm, SL, 2, row_off, col_off);
+    const v8b v3 = load_v_frag(sm, SL, 3, row_off, col_off);
+    o.a = mfma16(v0, ps, o.a);
+    o.b = mfma16(v1, ps, o.b);
+    o.c = mfma16(v2, ps, o.c);
+    o.d = mfma16(v3, ps, o.d);
 }
 
 __device__ __forceinline__ void store_o(float *O, int o_stride, int q_base, int M, const o_tile &o) {
