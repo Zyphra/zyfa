@@ -1,5 +1,5 @@
 // HK GQA causal + XCD pair, fp8 fat 32x32x64, KN=128, streamed LDS K/V.
-// QK stays at lgkmcnt(2); next-K ds_read under last PV aliases k_frag (aiter).
+// KV loop unrolled 8. QK stays at lgkmcnt(2); next-K under last PV aliases k_frag.
 // One bar per tile (after softmax, before last PV). D=Dv=128 / 8-wave / causal only.
 // RESCALE_SKIP: true (default) = HK Δmax≤8 delayed update. false = always rescale.
 #ifndef RESCALE_SKIP
@@ -176,7 +176,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         issue_k_pair<0>(kf, k_off(lds_u32(s.k[0].data), 0));
         pin_kf(kf);
 
-        for (int kb = 0; kb < max_num_tiles; ++kb) {
+        auto one_tile = [&](int kb) {
             const int cur = kb & 1, nx = cur ^ 1;
             const uint32_t kbase = lds_u32(s.k[cur].data);
             const uint32_t vbase = lds_u32(s.v[cur].data);
@@ -197,9 +197,19 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             qk_tail<true>(att, kf, qT.d1, 2);
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s4(att, q_start, kb);
-
             softmax_pv(oR, att, vbase, scale, m_, l_, kf, k_next_off);
+        };
+
+        int kb = 0;
+        const int n8 = max_num_tiles & ~7;
+#pragma unroll 1
+        for (; kb < n8; kb += 8) {
+#pragma unroll
+            for (int u = 0; u < 8; ++u)
+                one_tile(kb + u);
         }
+        for (; kb < max_num_tiles; ++kb)
+            one_tile(kb);
 
         store_o_fp8(Oh, q_start, M, oR, l_, q_stride);
         if (Lh) {

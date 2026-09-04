@@ -1,5 +1,6 @@
 // HK GQA causal + XCD pair, bf16 32x32x16, KN=64, streamed LDS K/V.
-// One bar per tile (next iter's bar covers V lifetime). Research kernel. D=192 / Dv=128 / 8-wave / causal only. Do not fold into fmha32.hip.
+// KV loop unrolled 8. One bar per tile (next iter's bar covers V lifetime).
+// D=192 / Dv=128 / 8-wave / causal only. Do not fold into fmha32.hip.
 // RESCALE_SKIP: true (default) = HK Δmax≤8 delayed update. false = always rescale.
 #ifndef RESCALE_SKIP
 #define RESCALE_SKIP true
@@ -164,7 +165,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
         prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, k_stride), k_stride);
         prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, v_stride), v_stride);
 
-        for (int kb = 0; kb < max_num_tiles; ++kb) {
+        auto one_tile = [&](int kb) {
             const int cur = kb & 1, nx = cur ^ 1;
             wg_bar();
             const int kb_n = (kb + 1 < max_num_tiles) ? kb + 1 : kb;
@@ -195,7 +196,18 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s2(att, q_start, kb);
             softmax_pv(oR, att, s.v[cur], m_, l_);
+        };
+
+        int kb = 0;
+        const int n8 = max_num_tiles & ~7;
+#pragma unroll 1
+        for (; kb < n8; kb += 8) {
+#pragma unroll
+            for (int u = 0; u < 8; ++u)
+                one_tile(kb + u);
         }
+        for (; kb < max_num_tiles; ++kb)
+            one_tile(kb);
 
         store_o(Oh, q_start, M, oR, l_, o_stride);
         if (Lh) {
