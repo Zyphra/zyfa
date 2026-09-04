@@ -19,6 +19,9 @@ using hk8::pack_v2x4;
 using hk8::ds_tr8;
 using hk8::load32;
 using hk8::lds_u32;
+using hk8::ds_b128;
+using hk8::k_frag;
+using hk8::pin_kf;
 using hk8::fmha_qoff;
 using hk8::max3;
 using hk8::xor32_max;
@@ -86,25 +89,55 @@ __device__ __forceinline__ uint32_t k_off(uint32_t kbase, int ds) {
     return kbase + (uint32_t)(c32 * KSTRIDE + P * 32);
 }
 
+__device__ __forceinline__ void issue_k_a(k_frag &f, uint32_t off) {
+    ds_b128<0>(f.a0, off);
+    ds_b128<16>(f.a1, off);
+}
+__device__ __forceinline__ void issue_k_b(k_frag &f, uint32_t off) {
+    ds_b128<8192>(f.b0, off);
+    ds_b128<8208>(f.b1, off);
+}
+__device__ __forceinline__ void issue_k_pair(k_frag &f, uint32_t off) {
+    issue_k_a(f, off);
+    issue_k_b(f, off);
+}
+
+// Consume kf at lgkmcnt(2); next D-half's ds_reads overlap the second MFMA.
+template <bool Acc>
+__device__ __forceinline__ void qk_step(s2_tile &s, k_frag &f, i32x8 qb, uint32_t next_off) {
+    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
+    if constexpr (Acc)
+        s.a = kh_mma(pack8(f.a0, f.a1), qb, s.a);
+    else
+        s.a = kh_mma0(pack8(f.a0, f.a1), qb);
+    issue_k_a(f, next_off);
+    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(f.b0), "+v"(f.b1), "+v"(f.a0), "+v"(f.a1));
+    if constexpr (Acc)
+        s.b = kh_mma(pack8(f.b0, f.b1), qb, s.b);
+    else
+        s.b = kh_mma0(pack8(f.b0, f.b1), qb);
+    issue_k_b(f, next_off);
+}
+
+template <bool Acc>
+__device__ __forceinline__ void qk_tail(s2_tile &s, k_frag &f, i32x8 qb) {
+    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
+    if constexpr (Acc)
+        s.a = kh_mma(pack8(f.a0, f.a1), qb, s.a);
+    else
+        s.a = kh_mma0(pack8(f.a0, f.a1), qb);
+    asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(f.b0), "+v"(f.b1));
+    if constexpr (Acc)
+        s.b = kh_mma(pack8(f.b0, f.b1), qb, s.b);
+    else
+        s.b = kh_mma0(pack8(f.b0, f.b1), qb);
+}
+
 template <bool Acc>
 __device__ __forceinline__ void mma_qk_pair(s2_tile &s, uint32_t off, i32x8 qb) {
-    i32x4 a0, a1, b0, b1;
-    asm volatile("ds_read_b128 %[a0], %[addr]\n\t"
-                 "ds_read_b128 %[a1], %[addr] offset:16\n\t"
-                 "ds_read_b128 %[b0], %[addr] offset:8192\n\t"
-                 "ds_read_b128 %[b1], %[addr] offset:8208\n\t"
-                 "s_waitcnt lgkmcnt(2)"
-                 : [a0] "=&v"(a0), [a1] "=&v"(a1), [b0] "=&v"(b0), [b1] "=&v"(b1)
-                 : [addr] "v"(off));
-    if constexpr (Acc)
-        s.a = kh_mma(pack8(a0, a1), qb, s.a);
-    else
-        s.a = kh_mma0(pack8(a0, a1), qb);
-    asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(b0), "+v"(b1));
-    if constexpr (Acc)
-        s.b = kh_mma(pack8(b0, b1), qb, s.b);
-    else
-        s.b = kh_mma0(pack8(b0, b1), qb);
+    k_frag f;
+    issue_k_pair(f, off);
+    qk_tail<Acc>(s, f, qb);
 }
 
 __device__ __forceinline__ uint32_t v_tr8_off(uint32_t vbase, int j, int nk, int half) {
@@ -134,6 +167,32 @@ __device__ __forceinline__ void mma_pv_lds(o_tile &o, uint32_t vbase, i32x8 ps) 
     o.c = kh_mma(ps, pack_v2x4(c0, c1, c2, c3), o.c);
     asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3));
     o.d = kh_mma(ps, pack_v2x4(d0, d1, d2, d3), o.d);
+}
+
+// Last 2 PV MFMAs overlap next-K ds_read into kf (same dests as next QK A-ops).
+__device__ __forceinline__ void mma_pv_lds_khead(o_tile &o, uint32_t vbase, i32x8 ps, k_frag &kf, uint32_t k_next_off) {
+    v2i32 a0 = ds_tr8(v_tr8_off(vbase, 0, 0, 0)), a1 = ds_tr8(v_tr8_off(vbase, 0, 0, 1));
+    v2i32 a2 = ds_tr8(v_tr8_off(vbase, 0, 1, 0)), a3 = ds_tr8(v_tr8_off(vbase, 0, 1, 1));
+    v2i32 b0 = ds_tr8(v_tr8_off(vbase, 1, 0, 0)), b1 = ds_tr8(v_tr8_off(vbase, 1, 0, 1));
+    v2i32 b2 = ds_tr8(v_tr8_off(vbase, 1, 1, 0)), b3 = ds_tr8(v_tr8_off(vbase, 1, 1, 1));
+    asm volatile("s_waitcnt lgkmcnt(4)"
+                 : "+v"(a0), "+v"(a1), "+v"(a2), "+v"(a3), "+v"(b0), "+v"(b1), "+v"(b2), "+v"(b3));
+    o.a = kh_mma(ps, pack_v2x4(a0, a1, a2, a3), o.a);
+    v2i32 c0 = ds_tr8(v_tr8_off(vbase, 2, 0, 0)), c1 = ds_tr8(v_tr8_off(vbase, 2, 0, 1));
+    v2i32 c2 = ds_tr8(v_tr8_off(vbase, 2, 1, 0)), c3 = ds_tr8(v_tr8_off(vbase, 2, 1, 1));
+    asm volatile("s_waitcnt lgkmcnt(4)"
+                 : "+v"(b0), "+v"(b1), "+v"(b2), "+v"(b3), "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3));
+    o.b = kh_mma(ps, pack_v2x4(b0, b1, b2, b3), o.b);
+    v2i32 d0 = ds_tr8(v_tr8_off(vbase, 3, 0, 0)), d1 = ds_tr8(v_tr8_off(vbase, 3, 0, 1));
+    v2i32 d2 = ds_tr8(v_tr8_off(vbase, 3, 1, 0)), d3 = ds_tr8(v_tr8_off(vbase, 3, 1, 1));
+    asm volatile("s_waitcnt lgkmcnt(4)"
+                 : "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3), "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3));
+    o.c = kh_mma(ps, pack_v2x4(c0, c1, c2, c3), o.c);
+    issue_k_a(kf, k_next_off);
+    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3), "+v"(kf.a0), "+v"(kf.a1));
+    o.d = kh_mma(ps, pack_v2x4(d0, d1, d2, d3), o.d);
+    issue_k_b(kf, k_next_off);
+    pin_kf(kf);
 }
 
 __device__ __forceinline__ void mask_s2(s2_tile &s, int q_start, int kb) {

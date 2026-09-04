@@ -66,8 +66,17 @@ struct s4_tile {
     fx16 a, b, c, d;
 };
 
+// One QK pair (4x b128 = 16 VGPR). Reused: K -> (dead in softmax) -> next K.
+// Aiter aliases these onto v[20:35]. Named members so they stay in VGPR.
+struct k_frag {
+    i32x4 a0, a1, b0, b1;
+};
+
 __device__ __forceinline__ void pin_q8(q8_tile &) {}
 __device__ __forceinline__ void pin_s4(s4_tile &) {}
+__device__ __forceinline__ void pin_kf(k_frag &f) {
+    asm volatile("" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
+}
 
 __device__ __forceinline__ int fmha_qoff(int r, int g) { return (r / 4) * 8 + g * 4 + (r % 4); }
 
@@ -209,24 +218,77 @@ __device__ __forceinline__ void ds4_wait2(i32x4 &a0, i32x4 &a1, i32x4 &b0, i32x4
                      : [addr] "v"(off));
 }
 
-template <bool Acc>
-__device__ __forceinline__ void mma_qk_pair(s4_tile &s, uint32_t off, i32x8 qb, int nk0) {
-    i32x4 a0, a1, b0, b1;
-    if (nk0 == 0)
-        ds4_wait2<0>(a0, a1, b0, b1, off);
-    else
-        ds4_wait2<8192>(a0, a1, b0, b1, off);
+// Issue one K pair (2+2 b128). No wait — consumer uses lgkmcnt(2).
+template <int Base>
+__device__ __forceinline__ void issue_k_a(k_frag &f, uint32_t off) {
+    if constexpr (Base == 0) {
+        ds_b128<0>(f.a0, off);
+        ds_b128<16>(f.a1, off);
+    } else {
+        ds_b128<8192>(f.a0, off);
+        ds_b128<8208>(f.a1, off);
+    }
+}
+template <int Base>
+__device__ __forceinline__ void issue_k_b(k_frag &f, uint32_t off) {
+    if constexpr (Base == 0) {
+        ds_b128<4096>(f.b0, off);
+        ds_b128<4112>(f.b1, off);
+    } else {
+        ds_b128<12288>(f.b0, off);
+        ds_b128<12304>(f.b1, off);
+    }
+}
+template <int Base>
+__device__ __forceinline__ void issue_k_pair(k_frag &f, uint32_t off) {
+    issue_k_a<Base>(f, off);
+    issue_k_b<Base>(f, off);
+}
+
+// Consume k_frag at lgkmcnt(2), overlap next pair's ds_reads (aiter QK wait).
+template <bool Acc, int NextBase>
+__device__ __forceinline__ void qk_step(s4_tile &s, k_frag &f, i32x8 qb, int nk0, uint32_t next_off) {
     fx16 &lo = nk0 ? s.c : s.a;
     fx16 &hi = nk0 ? s.d : s.b;
+    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
     if constexpr (Acc)
-        lo = kh_mma(pack8(a0, a1), qb, lo);
+        lo = kh_mma(pack8(f.a0, f.a1), qb, lo);
     else
-        lo = kh_mma0(pack8(a0, a1), qb);
-    asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(b0), "+v"(b1));
+        lo = kh_mma0(pack8(f.a0, f.a1), qb);
+    issue_k_a<NextBase>(f, next_off);
+    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(f.b0), "+v"(f.b1), "+v"(f.a0), "+v"(f.a1));
     if constexpr (Acc)
-        hi = kh_mma(pack8(b0, b1), qb, hi);
+        hi = kh_mma(pack8(f.b0, f.b1), qb, hi);
     else
-        hi = kh_mma0(pack8(b0, b1), qb);
+        hi = kh_mma0(pack8(f.b0, f.b1), qb);
+    issue_k_b<NextBase>(f, next_off);
+}
+
+// Last QK pair: no next-K issue (PV refills k_frag). Keep wait on hi.
+template <bool Acc>
+__device__ __forceinline__ void qk_tail(s4_tile &s, k_frag &f, i32x8 qb, int nk0) {
+    fx16 &lo = nk0 ? s.c : s.a;
+    fx16 &hi = nk0 ? s.d : s.b;
+    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
+    if constexpr (Acc)
+        lo = kh_mma(pack8(f.a0, f.a1), qb, lo);
+    else
+        lo = kh_mma0(pack8(f.a0, f.a1), qb);
+    asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(f.b0), "+v"(f.b1));
+    if constexpr (Acc)
+        hi = kh_mma(pack8(f.b0, f.b1), qb, hi);
+    else
+        hi = kh_mma0(pack8(f.b0, f.b1), qb);
+}
+
+template <bool Acc>
+__device__ __forceinline__ void mma_qk_pair(s4_tile &s, uint32_t off, i32x8 qb, int nk0) {
+    k_frag f;
+    if (nk0 == 0)
+        issue_k_pair<0>(f, off);
+    else
+        issue_k_pair<8192>(f, off);
+    qk_tail<Acc>(s, f, qb, nk0);
 }
 
 struct pv_v_head {
@@ -262,6 +324,30 @@ __device__ __forceinline__ void mma_pv_lds_preissued(o_tile &o, uint32_t vbase, 
     o.c = kh_mma(ps, pack_v2x4(c0, c1, c2, c3), o.c);
     asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3));
     o.d = kh_mma(ps, pack_v2x4(d0, d1, d2, d3), o.d);
+}
+
+// Last 4 PV + next-K ds_read into kf (aiter: dests alias next QK A-ops).
+__device__ __forceinline__ void mma_pv_lds_khead(o_tile &o, uint32_t vbase, i32x8 ps, int nk0, k_frag &kf,
+                                                uint32_t k_next_off) {
+    pv_v_head h = preissue_pv_v(vbase, nk0);
+    asm volatile("s_waitcnt lgkmcnt(4)"
+                 : "+v"(h.a0), "+v"(h.a1), "+v"(h.a2), "+v"(h.a3), "+v"(h.b0), "+v"(h.b1), "+v"(h.b2), "+v"(h.b3));
+    o.a = kh_mma(ps, pack_v2x4(h.a0, h.a1, h.a2, h.a3), o.a);
+    v2i32 c0 = ds_tr8(v_tr8_off(vbase, 2, nk0, 0)), c1 = ds_tr8(v_tr8_off(vbase, 2, nk0, 1));
+    v2i32 c2 = ds_tr8(v_tr8_off(vbase, 2, nk0 + 1, 0)), c3 = ds_tr8(v_tr8_off(vbase, 2, nk0 + 1, 1));
+    asm volatile("s_waitcnt lgkmcnt(4)"
+                 : "+v"(h.b0), "+v"(h.b1), "+v"(h.b2), "+v"(h.b3), "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3));
+    o.b = kh_mma(ps, pack_v2x4(h.b0, h.b1, h.b2, h.b3), o.b);
+    v2i32 d0 = ds_tr8(v_tr8_off(vbase, 3, nk0, 0)), d1 = ds_tr8(v_tr8_off(vbase, 3, nk0, 1));
+    v2i32 d2 = ds_tr8(v_tr8_off(vbase, 3, nk0 + 1, 0)), d3 = ds_tr8(v_tr8_off(vbase, 3, nk0 + 1, 1));
+    asm volatile("s_waitcnt lgkmcnt(4)"
+                 : "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3), "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3));
+    o.c = kh_mma(ps, pack_v2x4(c0, c1, c2, c3), o.c);
+    issue_k_a<0>(kf, k_next_off);
+    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3), "+v"(kf.a0), "+v"(kf.a1));
+    o.d = kh_mma(ps, pack_v2x4(d0, d1, d2, d3), o.d);
+    issue_k_b<0>(kf, k_next_off);
+    pin_kf(kf);
 }
 
 __device__ __forceinline__ void mma_pv_lds(o_tile &o, uint32_t vbase, i32x8 ps, int nk0) {

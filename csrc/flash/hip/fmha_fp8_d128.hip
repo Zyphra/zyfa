@@ -1,5 +1,6 @@
 // HK GQA causal + XCD pair, fp8 fat 32x32x64, KN=128, streamed LDS K/V.
-// One bar per tile (next iter's bar covers V lifetime). Research kernel. D=Dv=128 / 8-wave / causal only. Do not fold into fmha_fp8.hip.
+// QK stays at lgkmcnt(2); next-K ds_read under last PV aliases k_frag (aiter).
+// One bar per tile (after softmax, before last PV). D=Dv=128 / 8-wave / causal only.
 // RESCALE_SKIP: true (default) = HK Δmax≤8 delayed update. false = always rescale.
 #ifndef RESCALE_SKIP
 #define RESCALE_SKIP true
@@ -50,7 +51,8 @@ __device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
     }
 }
 
-__device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase, float scale, float &m_, float &l_) {
+__device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase, float scale, float &m_, float &l_,
+                                          k_frag &kf, uint32_t k_next_off) {
     const float mx = col_max4_sc(s, scale);
     const float mnew = fmaxf(m_, mx);
 #if RESCALE_SKIP
@@ -80,7 +82,9 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     mma_pv_lds_preissued(o, vbase, pack_p(s.a, s.b), 0, vh);
     exp2_sc(s.c, scale, mref);
     exp2_sc(s.d, scale, mref);
-    mma_pv_lds(o, vbase, pack_p(s.c, s.d), 2);
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    wg_bar();
+    mma_pv_lds_khead(o, vbase, pack_p(s.c, s.d), 2, kf, k_next_off);
     __builtin_amdgcn_s_setprio(0);
     l_ = l_ * corr + col_sum4(s);
 }
@@ -158,6 +162,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
 
         q8_tile qT;
         o_tile oR;
+        k_frag kf;
         zero_o(oR);
         load_q8(qT, Qh + (size_t)tile_idx * Q_BLOCK * q_stride, q_stride);
         float m_ = neg_inf(), l_ = 0.f;
@@ -166,10 +171,13 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             wg_bar();
         prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, kv_stride), kv_stride);
         prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, kv_stride), kv_stride);
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        wg_bar();
+        issue_k_pair<0>(kf, k_off(lds_u32(s.k[0].data), 0));
+        pin_kf(kf);
 
         for (int kb = 0; kb < max_num_tiles; ++kb) {
             const int cur = kb & 1, nx = cur ^ 1;
-            wg_bar();
             const uint32_t kbase = lds_u32(s.k[cur].data);
             const uint32_t vbase = lds_u32(s.v[cur].data);
             const int kb_n = (kb + 1 < max_num_tiles) ? kb + 1 : kb;
@@ -177,19 +185,20 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             const unsigned char *gVn = kv_tile_ptr(Vh, kb_n, kv_stride);
             s4_tile att;
             const uint32_t off0 = k_off(kbase, 0), off1 = k_off(kbase, 1);
+            const uint32_t k_next_off = k_off(lds_u32(s.k[nx].data), 0);
             __builtin_amdgcn_iglp_opt(0);
             prefetch_k_pass<0>(s.k[nx], gKn, kv_stride);
-            mma_qk_pair<false>(att, off0, qT.d0, 0);
+            qk_step<false, 8192>(att, kf, qT.d0, 0, off0);
             prefetch_k_pass<1>(s.k[nx], gKn, kv_stride);
-            mma_qk_pair<false>(att, off0, qT.d0, 2);
+            qk_step<false, 0>(att, kf, qT.d0, 2, off1);
             prefetch_v_pass<0>(s.v[nx], gVn, kv_stride);
-            mma_qk_pair<true>(att, off1, qT.d1, 0);
+            qk_step<true, 8192>(att, kf, qT.d1, 0, off1);
             prefetch_v_pass<1>(s.v[nx], gVn, kv_stride);
-            mma_qk_pair<true>(att, off1, qT.d1, 2);
+            qk_tail<true>(att, kf, qT.d1, 2);
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s4(att, q_start, kb);
 
-            softmax_pv(oR, att, vbase, scale, m_, l_);
+            softmax_pv(oR, att, vbase, scale, m_, l_, kf, k_next_off);
         }
 
         store_o_fp8(Oh, q_start, M, oR, l_, q_stride);
