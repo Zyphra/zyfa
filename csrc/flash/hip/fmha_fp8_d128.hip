@@ -74,19 +74,22 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     const float mref = mnew;
     m_ = mnew;
 #endif
+    // Aiter wall: 64 exp, pack, then 8 PV. V G2S / Vtr complete during exp.
     pv_v_head vh = preissue_pv_v(vbase, 0);
     __builtin_amdgcn_iglp_opt(2);
     exp2_sc(s.a, scale, mref);
     exp2_sc(s.b, scale, mref);
-    __builtin_amdgcn_s_setprio(1);
-    mma_pv_lds_preissued(o, vbase, pack_p(s.a, s.b), 0, vh);
     exp2_sc(s.c, scale, mref);
     exp2_sc(s.d, scale, mref);
+    const i32x8 p_lo = pack_p(s.a, s.b);
+    const i32x8 p_hi = pack_p(s.c, s.d);
+    l_ = l_ * corr + col_sum4(s);
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     wg_bar();
-    mma_pv_lds_khead(o, vbase, pack_p(s.c, s.d), 2, kf, k_next_off);
+    __builtin_amdgcn_s_setprio(1);
+    mma_pv_lds_preissued(o, vbase, p_lo, 0, vh);
+    mma_pv_lds_khead(o, vbase, p_hi, 2, kf, k_next_off);
     __builtin_amdgcn_s_setprio(0);
-    l_ = l_ * corr + col_sum4(s);
 }
 
 template <bool PairHeads, bool Bshd>
@@ -187,6 +190,10 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             const uint32_t off0 = k_off(kbase, 0), off1 = k_off(kbase, 1);
             const uint32_t k_next_off = k_off(lds_u32(s.k[nx].data), 0);
             __builtin_amdgcn_iglp_opt(0);
+            if (warpid() < 4)
+                __builtin_amdgcn_s_setprio(1);
+            else
+                __builtin_amdgcn_s_setprio(0);
             prefetch_k_pass<0>(s.k[nx], gKn, kv_stride);
             qk_step<false, 8192>(att, kf, qT.d0, 0, off0);
             prefetch_k_pass<1>(s.k[nx], gKn, kv_stride);

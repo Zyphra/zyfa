@@ -76,13 +76,14 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase
 #endif
     __builtin_amdgcn_iglp_opt(2);
     hk8::exp2_sc(s.a, scale, mref);
-    __builtin_amdgcn_s_setprio(1);
     hk8::exp2_sc(s.b, scale, mref);
+    const i32x8 ps = pack_p(s.a, s.b);
+    l_ = l_ * corr + col_sum2(s);
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     wg_bar();
-    mma_pv_lds_khead(o, vbase, pack_p(s.a, s.b), kf, k_next_off);
+    __builtin_amdgcn_s_setprio(1);
+    mma_pv_lds_khead(o, vbase, ps, kf, k_next_off);
     __builtin_amdgcn_s_setprio(0);
-    l_ = l_ * corr + col_sum2(s);
 }
 
 template <bool PairHeads, bool Bshd>
@@ -185,6 +186,10 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             s2_tile att;
             const uint32_t k_next_off = k_off(lds_u32(s.k[nx].data), 0);
             __builtin_amdgcn_iglp_opt(0);
+            if (warpid() < 4)
+                __builtin_amdgcn_s_setprio(1);
+            else
+                __builtin_amdgcn_s_setprio(0);
             prefetch_k_pass<0>(s.k[nx], gKn, k_stride);
             qk_step<false>(att, kf, qT.d0, k_off(kbase, 1));
             prefetch_k_pass<1>(s.k[nx], gKn, k_stride);
