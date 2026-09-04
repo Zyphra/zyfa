@@ -81,9 +81,9 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     exp2_sc(s.b, scale, mref);
     exp2_sc(s.c, scale, mref);
     exp2_sc(s.d, scale, mref);
-    const i32x8 p_lo = pack_p(s.a, s.b);
-    const i32x8 p_hi = pack_p(s.c, s.d);
     l_ = l_ * corr + col_sum4(s);
+    const i32x8 p_lo = pack_p_consume(s.a, s.b);
+    const i32x8 p_hi = pack_p_consume(s.c, s.d);
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     wg_bar();
     __builtin_amdgcn_s_setprio(1);
@@ -168,6 +168,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         k_frag kf;
         zero_o(oR);
         load_q8(qT, Qh + (size_t)tile_idx * Q_BLOCK * q_stride, q_stride);
+        pin_q8(qT);
         float m_ = neg_inf(), l_ = 0.f;
 
         if (pp)
