@@ -37,18 +37,10 @@ __device__ __forceinline__ const unsigned char *kv_tile_ptr(const unsigned char 
 __device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
     if (!__any(corr != 1.f))
         return;
-    const int gb = laneid() >> 5;
-    float ct[16];
-#pragma unroll
-    for (int r = 0; r < 16; ++r)
-        ct[r] = __shfl(corr, fmha_qoff(r, gb));
-#pragma unroll
-    for (int r = 0; r < 16; ++r) {
-        o.a[r] *= ct[r];
-        o.b[r] *= ct[r];
-        o.c[r] *= ct[r];
-        o.d[r] *= ct[r];
-    }
+    o.a = mulsc(o.a, corr);
+    o.b = mulsc(o.b, corr);
+    o.c = mulsc(o.c, corr);
+    o.d = mulsc(o.d, corr);
 }
 
 __device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase, float scale, float &m_, float &l_,

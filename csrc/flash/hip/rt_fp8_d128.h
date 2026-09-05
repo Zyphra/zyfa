@@ -315,19 +315,19 @@ __device__ __forceinline__ void mma_pv_lds_preissued(o_tile &o, uint32_t vbase, 
     const uint32_t a = v_tr8_off(vbase, 0, nk0, 0);
     asm volatile("s_waitcnt lgkmcnt(4)"
                  : "+v"(h.a0), "+v"(h.a1), "+v"(h.a2), "+v"(h.a3), "+v"(h.b0), "+v"(h.b1), "+v"(h.b2), "+v"(h.b3));
-    o.a = kh_mma(ps, pack_v2x4(h.a0, h.a1, h.a2, h.a3), o.a);
+    o.a = kh_mma(pack_v2x4(h.a0, h.a1, h.a2, h.a3), ps, o.a);
     v2i32 c0 = ds_tr8(a + 512u), c1 = ds_tr8(a + 1536u);
     v2i32 c2 = ds_tr8(a + 2560u), c3 = ds_tr8(a + 3584u);
     asm volatile("s_waitcnt lgkmcnt(4)"
                  : "+v"(h.b0), "+v"(h.b1), "+v"(h.b2), "+v"(h.b3), "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3));
-    o.b = kh_mma(ps, pack_v2x4(h.b0, h.b1, h.b2, h.b3), o.b);
+    o.b = kh_mma(pack_v2x4(h.b0, h.b1, h.b2, h.b3), ps, o.b);
     v2i32 d0 = ds_tr8(a + 768u), d1 = ds_tr8(a + 1792u);
     v2i32 d2 = ds_tr8(a + 2816u), d3 = ds_tr8(a + 3840u);
     asm volatile("s_waitcnt lgkmcnt(4)"
                  : "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3), "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3));
-    o.c = kh_mma(ps, pack_v2x4(c0, c1, c2, c3), o.c);
+    o.c = kh_mma(pack_v2x4(c0, c1, c2, c3), ps, o.c);
     asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3));
-    o.d = kh_mma(ps, pack_v2x4(d0, d1, d2, d3), o.d);
+    o.d = kh_mma(pack_v2x4(d0, d1, d2, d3), ps, o.d);
 }
 
 // Last 4 PV + next-K ds_read into kf (aiter: dests alias next QK A-ops).
@@ -337,20 +337,20 @@ __device__ __forceinline__ void mma_pv_lds_khead(o_tile &o, uint32_t vbase, i32x
     pv_v_head h = preissue_pv_v(vbase, nk0);
     asm volatile("s_waitcnt lgkmcnt(4)"
                  : "+v"(h.a0), "+v"(h.a1), "+v"(h.a2), "+v"(h.a3), "+v"(h.b0), "+v"(h.b1), "+v"(h.b2), "+v"(h.b3));
-    o.a = kh_mma(ps, pack_v2x4(h.a0, h.a1, h.a2, h.a3), o.a);
+    o.a = kh_mma(pack_v2x4(h.a0, h.a1, h.a2, h.a3), ps, o.a);
     v2i32 c0 = ds_tr8(a + 512u), c1 = ds_tr8(a + 1536u);
     v2i32 c2 = ds_tr8(a + 2560u), c3 = ds_tr8(a + 3584u);
     asm volatile("s_waitcnt lgkmcnt(4)"
                  : "+v"(h.b0), "+v"(h.b1), "+v"(h.b2), "+v"(h.b3), "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3));
-    o.b = kh_mma(ps, pack_v2x4(h.b0, h.b1, h.b2, h.b3), o.b);
+    o.b = kh_mma(pack_v2x4(h.b0, h.b1, h.b2, h.b3), ps, o.b);
     v2i32 d0 = ds_tr8(a + 768u), d1 = ds_tr8(a + 1792u);
     v2i32 d2 = ds_tr8(a + 2816u), d3 = ds_tr8(a + 3840u);
     asm volatile("s_waitcnt lgkmcnt(4)"
                  : "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3), "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3));
-    o.c = kh_mma(ps, pack_v2x4(c0, c1, c2, c3), o.c);
+    o.c = kh_mma(pack_v2x4(c0, c1, c2, c3), ps, o.c);
     issue_k_a<0>(kf, k_next_off);
     asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(d0), "+v"(d1), "+v"(d2), "+v"(d3), "+v"(kf.a0), "+v"(kf.a1));
-    o.d = kh_mma(ps, pack_v2x4(d0, d1, d2, d3), o.d);
+    o.d = kh_mma(pack_v2x4(d0, d1, d2, d3), ps, o.d);
     issue_k_b<0>(kf, k_next_off);
     pin_kf(kf);
 }
@@ -475,6 +475,18 @@ __device__ __forceinline__ void store_o_fp8(float *O, int q_base, int M, const o
     store_o_tile(O, q_base, M, o.b, 1, inv, seq_stride);
     store_o_tile(O, q_base, M, o.c, 2, inv, seq_stride);
     store_o_tile(O, q_base, M, o.d, 3, inv, seq_stride);
+}
+
+// A=V B=P: query stays in the lane, dests are d_v (kCOff). Same store as BF16.
+__device__ __forceinline__ void store_o_fp8_qrow(float *O, int q_base, int M, const o_tile &o, float l_,
+                                                int seq_stride = Dv) {
+    const float inv = (l_ > 0.f) ? __builtin_amdgcn_rcpf(l_) : 0.f;
+    o_tile t;
+    t.a = mulsc(o.a, inv);
+    t.b = mulsc(o.b, inv);
+    t.c = mulsc(o.c, inv);
+    t.d = mulsc(o.d, inv);
+    hk::store_o(O, seq_stride, q_base, M, t);
 }
 
 #undef HK8_GLD16
