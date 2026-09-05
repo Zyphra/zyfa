@@ -147,7 +147,9 @@ __device__ __forceinline__ void prefetch_k_pass(st8 &sm, const unsigned char *g,
     const int key = c / (D / 16);
     const int off16 = (c % (D / 16)) * 16;
     const int P = off16 / 32, r = off16 % 32;
-    const int L = (P - key) & 3;
+    // HBM-only (G2S dest stays c*16). XOR (key>>2) so keys 4 apart do not
+    // share a 32B slot; 4-way → 2-way on CDNA4 ds_read_b128 phases.
+    const int L = (P ^ (key >> 2)) & 3;
     const uint32_t range = (uint32_t)KN * (uint32_t)seq_stride;
     const uint32_t voff = (uint32_t)key * (uint32_t)seq_stride + (uint32_t)L * 32u + (uint32_t)r;
     g2s16(g, sm.data + key * D + P * 32 + r, voff, range);
@@ -195,7 +197,7 @@ __device__ __forceinline__ uint32_t v_tr8_off(uint32_t vbase, int j, int nk, int
 
 __device__ __forceinline__ uint32_t k_off(uint32_t kbase, int ds) {
     const int c32 = laneid() & 31, gb = laneid() >> 5;
-    const int P = ((ds * 2 + gb) + c32) & 3;
+    const int P = ((ds * 2 + gb) ^ (c32 >> 2)) & 3;
     return kbase + (uint32_t)(c32 * D + P * 32);
 }
 
