@@ -162,8 +162,11 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         pin_q192(qT);
         float m_ = neg_inf(), l_ = 0.f;
 
-        if (pp)
+        if (pp) {
+            if constexpr (PairHeads)
+                asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             wg_bar();
+        }
         prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, k_stride), k_stride);
         prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, v_stride), v_stride);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -172,6 +175,8 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         pin_kf(kf);
 
         auto one_tile = [&](int kb) {
+            // Required for BSHD vs BHSD bitwise match: without it pack_p
+            // takes a different schedule on the two instantiations.
             asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
             wg_bar();
             const int cur = kb & 1, nx = cur ^ 1;

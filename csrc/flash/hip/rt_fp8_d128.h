@@ -249,13 +249,13 @@ __device__ __forceinline__ void issue_k_pair(k_frag &f, uint32_t off) {
     issue_k_b<Base>(f, off);
 }
 
-// Drain LGKM before the first MFMA. lgkmcnt(2) is only safe when no other DS
-// (spills, leftover PV) is in flight; those leak into the count and QK races.
+// AITER QK wait: lgkmcnt(2). Safe when leftover PV DS is gone (preissued
+// PV ends at lgkmcnt(0)). Count 0 here serializes the next K pair.
 template <bool Acc, int NextBase>
 __device__ __forceinline__ void qk_step(s4_tile &s, k_frag &f, const i32x8 &qb, int nk0, uint32_t next_off) {
     fx16 &lo = nk0 ? s.c : s.a;
     fx16 &hi = nk0 ? s.d : s.b;
-    asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
+    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
     if constexpr (Acc)
         lo = kh_mma(pack8(f.a0, f.a1), qb, lo);
     else
@@ -274,7 +274,7 @@ template <bool Acc>
 __device__ __forceinline__ void qk_tail(s4_tile &s, k_frag &f, const i32x8 &qb, int nk0) {
     fx16 &lo = nk0 ? s.c : s.a;
     fx16 &hi = nk0 ? s.d : s.b;
-    asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
+    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
     if constexpr (Acc)
         lo = kh_mma(pack8(f.a0, f.a1), qb, lo);
     else
@@ -403,17 +403,19 @@ __device__ __forceinline__ void exp2_sc(fx16 &s, float scale, float mnew) {
     }
 }
 
-__device__ __forceinline__ float col_sum4(const s4_tile &s) {
+__device__ __forceinline__ float sum2_local(const fx16 &a, const fx16 &b) {
     f2 acc = {0.f, 0.f};
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const f2 a = {s.a[2 * i], s.a[2 * i + 1]};
-        const f2 b = {s.b[2 * i], s.b[2 * i + 1]};
-        const f2 c = {s.c[2 * i], s.c[2 * i + 1]};
-        const f2 d = {s.d[2 * i], s.d[2 * i + 1]};
-        acc += (a + b) + (c + d);
+        const f2 x = {a[2 * i], a[2 * i + 1]};
+        const f2 y = {b[2 * i], b[2 * i + 1]};
+        acc += x + y;
     }
-    return xor32_sum(acc[0] + acc[1]);
+    return acc[0] + acc[1];
+}
+
+__device__ __forceinline__ float col_sum4(const s4_tile &s) {
+    return xor32_sum(sum2_local(s.a, s.b) + sum2_local(s.c, s.d));
 }
 
 __device__ __forceinline__ void sub_s4(s4_tile &s, float m) {

@@ -66,20 +66,24 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     const float mref = mnew;
     m_ = mnew;
 #endif
-    // Aiter wall: 64 exp, pack, then 8 PV. V G2S / Vtr complete during exp.
+    // Current V is already in LDS (prior tile bar). First 4 PV run under
+    // exp(c,d); vmcnt+bar only before next-K issue in the last 4 PV.
     pv_v_head vh = preissue_pv_v(vbase, 0);
     __builtin_amdgcn_iglp_opt(2);
     exp2_sc(s.a, scale, mref);
     exp2_sc(s.b, scale, mref);
+    const float sum_ab = sum2_local(s.a, s.b);
+    const i32x8 p_lo = pack_p_consume(s.a, s.b);
+    __builtin_amdgcn_s_setprio(1);
+    mma_pv_lds_preissued(o, vbase, p_lo, 0, vh);
+    __builtin_amdgcn_s_setprio(0);
     exp2_sc(s.c, scale, mref);
     exp2_sc(s.d, scale, mref);
-    l_ = l_ * corr + col_sum4(s);
-    const i32x8 p_lo = pack_p_consume(s.a, s.b);
+    l_ = l_ * corr + xor32_sum(sum_ab + sum2_local(s.c, s.d));
     const i32x8 p_hi = pack_p_consume(s.c, s.d);
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     wg_bar();
     __builtin_amdgcn_s_setprio(1);
-    mma_pv_lds_preissued(o, vbase, p_lo, 0, vh);
     mma_pv_lds_khead(o, vbase, p_hi, 2, kf, k_next_off);
     __builtin_amdgcn_s_setprio(0);
 }
@@ -171,10 +175,12 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         pin_kf(kf);
 
         auto one_tile = [&](int kb) {
-            // Per-wave waitcnt is not enough: other waves' G2S/DS can still
-            // be writing the shared K/V tile. Drain, then bar, then QK.
-            asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
-            wg_bar();
+            if constexpr (PairHeads) {
+                // Two 4-wave groups share K/V. Drain this wave's G2S before
+                // the other group reads the ping-pong slot.
+                asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+                wg_bar();
+            }
             const int cur = kb & 1, nx = cur ^ 1;
             const uint32_t kbase = lds_u32(s.k[cur].data);
             const uint32_t vbase = lds_u32(s.v[cur].data);
