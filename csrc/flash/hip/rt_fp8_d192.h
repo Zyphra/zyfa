@@ -227,7 +227,7 @@ __device__ __forceinline__ float col_sum2(const s2_tile &s) {
     return xor32_sum(acc[0] + acc[1]);
 }
 
-__device__ __forceinline__ void store_o_fp8(float *O, int q_base, int M, const o_tile &o, float l_,
+__device__ __forceinline__ void store_o_fp8(bf16 *O, int q_base, int M, const o_tile &o, float l_,
                                            int seq_stride = Dv) {
     hk8::store_o_fp8_qrow(O, q_base, M, o, l_, seq_stride);
 }

@@ -81,7 +81,7 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s_tile &s, const st_v &vsm
 }
 
 template <bool PairHeads, bool Bshd>
-__global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K, const bf16 *V, float *O, float *Lse,
+__global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse,
                                                     int M, int N, int Hq, int Hkv, float scale, int nxcd) {
     extern __shared__ Smem sm[];
     Smem &s = sm[0];
@@ -123,7 +123,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
     }
 
     const bf16 *Qh, *Kh, *Vh;
-    float *Oh;
+    bf16 *Oh;
     if constexpr (Bshd) {
         Qh = Q + ((size_t)batch_idx * M * Hq + (size_t)head_idx) * D;
         Kh = K + ((size_t)batch_idx * N * Hkv + (size_t)head_kv) * D;
@@ -217,7 +217,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
     }
 }
 
-static void run(const bf16 *Q, const bf16 *K, const bf16 *V, float *O, float *Lse, int M, int N, int B, int Hq, int Hkv,
+static void run(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse, int M, int N, int B, int Hq, int Hkv,
                 float scale, bool bshd, hipStream_t stream) {
     const int GROUP = Hq / Hkv;
     const bool pair_heads = GROUP >= 2 && (GROUP & 1) == 0;
@@ -268,8 +268,8 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     } else {
         TORCH_CHECK(v.size(1) == Hkv && v.size(2) == N);
     }
-    auto O = bshd ? torch::empty({B, M, Hq, Dv}, q.options().dtype(at::kFloat))
-                  : torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kFloat));
+    auto O = bshd ? torch::empty({B, M, Hq, Dv}, q.options().dtype(at::kBFloat16))
+                  : torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kBFloat16));
     torch::Tensor Lse;
     float *Lp = nullptr;
     if (return_lse) {
@@ -277,7 +277,8 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
         Lp = Lse.data_ptr<float>();
     }
     run(reinterpret_cast<const bf16 *>(q.data_ptr()), reinterpret_cast<const bf16 *>(k.data_ptr()),
-        reinterpret_cast<const bf16 *>(v.data_ptr()), O.data_ptr<float>(), Lp, M, N, B, Hq, Hkv, (float)scale * L2E,
+        reinterpret_cast<const bf16 *>(v.data_ptr()), reinterpret_cast<bf16 *>(O.data_ptr()), Lp, M, N, B, Hq, Hkv,
+        (float)scale * L2E,
         bshd, at::cuda::getCurrentCUDAStream());
     if (return_lse)
         return {O, Lse};

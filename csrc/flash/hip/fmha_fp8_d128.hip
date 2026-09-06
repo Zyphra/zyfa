@@ -86,7 +86,7 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
 
 template <bool PairHeads, bool Bshd>
 __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, const unsigned char *K,
-                                                    const unsigned char *V, float *O, float *Lse, int M, int N,
+                                                    const unsigned char *V, bf16 *O, float *Lse, int M, int N,
                                                     int Hq, int Hkv, float scale, int nxcd) {
     extern __shared__ Smem sm[];
     Smem &s = sm[0];
@@ -126,7 +126,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
     }
 
     const unsigned char *Qh, *Kh, *Vh;
-    float *Oh;
+    bf16 *Oh;
     if constexpr (Bshd) {
         Qh = Q + ((size_t)batch_idx * M * Hq + (size_t)head_idx) * D;
         Kh = K + ((size_t)batch_idx * N * Hkv + (size_t)head_kv) * D;
@@ -219,7 +219,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
     }
 }
 
-static void run(const unsigned char *Q, const unsigned char *K, const unsigned char *V, float *O, float *Lse,
+static void run(const unsigned char *Q, const unsigned char *K, const unsigned char *V, bf16 *O, float *Lse,
                 int M, int N, int B, int Hq, int Hkv, float scale, bool bshd, hipStream_t stream) {
     const int GROUP = Hq / Hkv;
     const bool pair_heads = GROUP >= 2 && (GROUP & 1) == 0;
@@ -273,8 +273,8 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     } else {
         TORCH_CHECK(v.size(1) == Hkv && v.size(2) == N);
     }
-    auto O = bshd ? torch::empty({B, M, Hq, Dv}, q.options().dtype(at::kFloat))
-                  : torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kFloat));
+    auto O = bshd ? torch::empty({B, M, Hq, Dv}, q.options().dtype(at::kBFloat16))
+                  : torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kBFloat16));
     torch::Tensor Lse;
     float *Lp = nullptr;
     if (return_lse) {
@@ -282,7 +282,8 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
         Lp = Lse.data_ptr<float>();
     }
     run((const unsigned char *)q.data_ptr(), (const unsigned char *)k.data_ptr(),
-        (const unsigned char *)v.data_ptr(), O.data_ptr<float>(), Lp, M, N, B, Hq, Hkv, (float)scale * L2E, bshd,
+        (const unsigned char *)v.data_ptr(), reinterpret_cast<bf16 *>(O.data_ptr()), Lp, M, N, B, Hq, Hkv,
+        (float)scale * L2E, bshd,
         at::cuda::getCurrentCUDAStream());
     if (return_lse)
         return {O, Lse};

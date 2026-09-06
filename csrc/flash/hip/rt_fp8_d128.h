@@ -455,18 +455,18 @@ __device__ __forceinline__ i32x8 pack_p_consume(fx16 &lo, fx16 &hi) {
     return pa;
 }
 
-__device__ __forceinline__ void store_o_tile(float *O, int q_base, int M, const fx16 &t, int j, const float *inv,
+__device__ __forceinline__ void store_o_tile(bf16 *O, int q_base, int M, const fx16 &t, int j, const float *inv,
                                             int seq_stride = Dv) {
     const int c32 = laneid() & 31, gb = laneid() >> 5;
 #pragma unroll
     for (int r = 0; r < 16; ++r) {
         const int q = q_base + fmha_qoff(r, gb);
         if (q < M)
-            O[(size_t)q * seq_stride + j * 32 + c32] = t[r] * inv[r];
+            O[(size_t)q * seq_stride + j * 32 + c32] = (bf16)(t[r] * inv[r]);
     }
 }
 
-__device__ __forceinline__ void store_o_fp8(float *O, int q_base, int M, const o_tile &o, float l_,
+__device__ __forceinline__ void store_o_fp8(bf16 *O, int q_base, int M, const o_tile &o, float l_,
                                            int seq_stride = Dv) {
     const int gb = laneid() >> 5;
     float inv[16];
@@ -480,7 +480,7 @@ __device__ __forceinline__ void store_o_fp8(float *O, int q_base, int M, const o
 }
 
 // A=V B=P: query stays in the lane, dests are d_v (kCOff). Same store as BF16.
-__device__ __forceinline__ void store_o_fp8_qrow(float *O, int q_base, int M, const o_tile &o, float l_,
+__device__ __forceinline__ void store_o_fp8_qrow(bf16 *O, int q_base, int M, const o_tile &o, float l_,
                                                 int seq_stride = Dv) {
     const float inv = (l_ > 0.f) ? __builtin_amdgcn_rcpf(l_) : 0.f;
     o_tile t;
