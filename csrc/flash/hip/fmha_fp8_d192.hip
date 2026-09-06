@@ -69,8 +69,8 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase
     __builtin_amdgcn_iglp_opt(2);
     hk8::exp2_sc(s.a, scale, mref);
     hk8::exp2_sc(s.b, scale, mref);
-    const i32x8 ps = pack_p(s.a, s.b);
     l_ = l_ * corr + col_sum2(s);
+    const i32x8 ps = pack_p(s.a, s.b);
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     wg_bar();
     __builtin_amdgcn_s_setprio(1);
@@ -86,10 +86,13 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
     Smem &s = sm[0];
 
     constexpr int D = 192, Dv = 128;
-    const int q_stride = Bshd ? Hq * D : D;
-    const int k_stride = Bshd ? Hkv * D : D;
-    const int v_stride = Bshd ? Hkv * Dv : Dv;
-    const int o_stride = Bshd ? Hq * Dv : Dv;
+    // Keep stride in an SGPR for both instantiations so BHSD does not
+    // constant-fold D and take a different pack_p / QK schedule than BSHD.
+    int q_stride = Bshd ? Hq * D : D;
+    int k_stride = Bshd ? Hkv * D : D;
+    int v_stride = Bshd ? Hkv * Dv : Dv;
+    int o_stride = Bshd ? Hq * Dv : Dv;
+    asm volatile("" : "+s"(q_stride), "+s"(k_stride), "+s"(v_stride), "+s"(o_stride));
     const int GROUP = Hq / Hkv;
     constexpr int QW = PairHeads ? (NW / 2) : NW;
     const int numQ = (M / Q_BLOCK + QW - 1) / QW;
@@ -169,6 +172,8 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         pin_kf(kf);
 
         auto one_tile = [&](int kb) {
+            asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
+            wg_bar();
             const int cur = kb & 1, nx = cur ^ 1;
             const uint32_t kbase = lds_u32(s.k[cur].data);
             const uint32_t vbase = lds_u32(s.v[cur].data);
@@ -251,11 +256,12 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     q = q.contiguous();
     k = k.contiguous();
     v = v.contiguous();
-    const int B = q.size(0), D = q.size(3), Dv = v.size(3);
+    const int D = q.size(3), Dv = v.size(3);
     const int Hq = bshd ? q.size(2) : q.size(1);
     const int M = bshd ? q.size(1) : q.size(2);
     const int Hkv = bshd ? k.size(2) : k.size(1);
     const int N = bshd ? k.size(1) : k.size(2);
+    const int B = q.size(0);
     TORCH_CHECK(D == 192 && Dv == 128 && M % 256 == 0 && N % 64 == 0);
     TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
     if (bshd) {
@@ -273,8 +279,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     }
     run((const unsigned char *)q.data_ptr(), (const unsigned char *)k.data_ptr(),
         (const unsigned char *)v.data_ptr(), reinterpret_cast<bf16 *>(O.data_ptr()), Lp, M, N, B, Hq, Hkv,
-        (float)scale * L2E, bshd,
-        at::cuda::getCurrentCUDAStream());
+        (float)scale * L2E, bshd, at::cuda::getCurrentCUDAStream());
     if (return_lse)
         return {O, Lse};
     return {O};

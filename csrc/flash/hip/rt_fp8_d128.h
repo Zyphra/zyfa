@@ -249,12 +249,13 @@ __device__ __forceinline__ void issue_k_pair(k_frag &f, uint32_t off) {
     issue_k_b<Base>(f, off);
 }
 
-// Consume k_frag at lgkmcnt(2), overlap next pair's ds_reads (aiter QK wait).
+// Drain LGKM before the first MFMA. lgkmcnt(2) is only safe when no other DS
+// (spills, leftover PV) is in flight; those leak into the count and QK races.
 template <bool Acc, int NextBase>
 __device__ __forceinline__ void qk_step(s4_tile &s, k_frag &f, const i32x8 &qb, int nk0, uint32_t next_off) {
     fx16 &lo = nk0 ? s.c : s.a;
     fx16 &hi = nk0 ? s.d : s.b;
-    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
+    asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
     if constexpr (Acc)
         lo = kh_mma(pack8(f.a0, f.a1), qb, lo);
     else
@@ -273,7 +274,7 @@ template <bool Acc>
 __device__ __forceinline__ void qk_tail(s4_tile &s, k_frag &f, const i32x8 &qb, int nk0) {
     fx16 &lo = nk0 ? s.c : s.a;
     fx16 &hi = nk0 ? s.d : s.b;
-    asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
+    asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
     if constexpr (Acc)
         lo = kh_mma(pack8(f.a0, f.a1), qb, lo);
     else

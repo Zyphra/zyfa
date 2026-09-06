@@ -84,16 +84,15 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     __builtin_amdgcn_s_setprio(0);
 }
 
-template <bool PairHeads, bool Bshd>
+template <bool PairHeads>
 __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, const unsigned char *K,
                                                     const unsigned char *V, bf16 *O, float *Lse, int M, int N,
-                                                    int Hq, int Hkv, float scale, int nxcd) {
+                                                    int Hq, int Hkv, float scale, int nxcd, int q_stride,
+                                                    int kv_stride, int bshd) {
     extern __shared__ Smem sm[];
     Smem &s = sm[0];
 
     constexpr int D = 128;
-    const int q_stride = Bshd ? Hq * D : D;
-    const int kv_stride = Bshd ? Hkv * D : D;
     const int GROUP = Hq / Hkv;
     constexpr int QW = PairHeads ? (NW / 2) : NW;
     const int numQ = (M / Q_BLOCK + QW - 1) / QW;
@@ -125,19 +124,14 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         qwarp = warpid();
     }
 
-    const unsigned char *Qh, *Kh, *Vh;
-    bf16 *Oh;
-    if constexpr (Bshd) {
-        Qh = Q + ((size_t)batch_idx * M * Hq + (size_t)head_idx) * D;
-        Kh = K + ((size_t)batch_idx * N * Hkv + (size_t)head_kv) * D;
-        Vh = V + ((size_t)batch_idx * N * Hkv + (size_t)head_kv) * D;
-        Oh = O + ((size_t)batch_idx * M * Hq + (size_t)head_idx) * D;
-    } else {
-        Qh = Q + ((size_t)batch_idx * Hq + head_idx) * M * D;
-        Kh = K + ((size_t)batch_idx * Hkv + head_kv) * N * D;
-        Vh = V + ((size_t)batch_idx * Hkv + head_kv) * N * D;
-        Oh = O + ((size_t)batch_idx * Hq + head_idx) * M * D;
-    }
+    const size_t q_sel = bshd ? ((size_t)batch_idx * M * Hq + (size_t)head_idx) * D
+                              : ((size_t)batch_idx * Hq + head_idx) * (size_t)M * D;
+    const size_t kv_sel = bshd ? ((size_t)batch_idx * N * Hkv + (size_t)head_kv) * D
+                               : ((size_t)batch_idx * Hkv + head_kv) * (size_t)N * D;
+    const unsigned char *Qh = Q + q_sel;
+    const unsigned char *Kh = K + kv_sel;
+    const unsigned char *Vh = V + kv_sel;
+    bf16 *Oh = O + q_sel;
     float *Lh = Lse ? Lse + ((size_t)batch_idx * Hq + head_idx) * M : nullptr;
 
     const int num_tiles = N / KV_BLOCK;
@@ -163,8 +157,12 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         pin_q8(qT);
         float m_ = neg_inf(), l_ = 0.f;
 
-        if (pp)
+        if (pp) {
+            // Pass 0's last G2S targets s.k[0] when tile count is even.
+            // Drain it before pass 1 prefetches tile 0 into the same slot.
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             wg_bar();
+        }
         prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, kv_stride), kv_stride);
         prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, kv_stride), kv_stride);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -173,6 +171,10 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         pin_kf(kf);
 
         auto one_tile = [&](int kb) {
+            // Per-wave waitcnt is not enough: other waves' G2S/DS can still
+            // be writing the shared K/V tile. Drain, then bar, then QK.
+            asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
+            wg_bar();
             const int cur = kb & 1, nx = cur ^ 1;
             const uint32_t kbase = lds_u32(s.k[cur].data);
             const uint32_t vbase = lds_u32(s.v[cur].data);
@@ -229,25 +231,18 @@ static void run(const unsigned char *Q, const unsigned char *K, const unsigned c
     const int nxcd = fmha_num_xcds();
     const size_t smem = sizeof(Smem);
     const int nheads = pair_heads ? (Hq / 2) : Hq;
-    if (pair_heads && bshd) {
-        hipFuncSetAttribute((const void *)attend_ker<true, true>, hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        attend_ker<true, true>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
-    } else if (pair_heads) {
-        hipFuncSetAttribute((const void *)attend_ker<true, false>, hipFuncAttributeMaxDynamicSharedMemorySize,
-                            (int)smem);
-        attend_ker<true, false>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
-    } else if (bshd) {
-        hipFuncSetAttribute((const void *)attend_ker<false, true>, hipFuncAttributeMaxDynamicSharedMemorySize,
-                            (int)smem);
-        attend_ker<false, true>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    constexpr int D = 128;
+    const int q_stride = bshd ? Hq * D : D;
+    const int kv_stride = bshd ? Hkv * D : D;
+    const int bshd_i = bshd ? 1 : 0;
+    if (pair_heads) {
+        hipFuncSetAttribute((const void *)attend_ker<true>, hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        attend_ker<true><<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd,
+                                                                     q_stride, kv_stride, bshd_i);
     } else {
-        hipFuncSetAttribute((const void *)attend_ker<false, false>, hipFuncAttributeMaxDynamicSharedMemorySize,
-                            (int)smem);
-        attend_ker<false, false>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+        hipFuncSetAttribute((const void *)attend_ker<false>, hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        attend_ker<false><<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd,
+                                                                      q_stride, kv_stride, bshd_i);
     }
 }
 

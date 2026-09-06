@@ -546,25 +546,16 @@ __device__ __forceinline__ void load_v(kv_tile &dst, const st<64, 128> &sm) {
     dst.d15 = load_v_frag(sm, 3, 3, row_off, col_off);
 }
 
-// Pack two f32 → one bf16 pair (lo=a, hi=b). Matches AITER v_cvt_pk_bf16_f32.
-__device__ __forceinline__ uint32_t cvt_pk_bf16(float a, float b) {
-    uint32_t p;
-    asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2" : "=v"(p) : "v"(a), "v"(b));
-    return p;
-}
-
-// C-layout groups {0,1,2,3}, {8,9,10,11}, … — 4 contiguous d, 4× dwordx2 of bf16.
+// C-layout via kCOff. Packed dwordx2 at row+g*8 is address-equivalent on
+// paper but the vector store scrambles FP8 d192 O (cos~0 vs SDPA). Scalar
+// scatter is what matched AITER when O was still FP32.
 __device__ __forceinline__ void store_half(bf16 *O, int o_stride, int q, int i, fx16 v) {
     const int lane = laneid();
     const int d0 = i * 32 + ((lane >> 5) << 2);
-    bf16 *row = O + (size_t)q * o_stride + d0;
-    typedef uint32_t u32x2 __attribute__((ext_vector_type(2)));
 #pragma unroll
-    for (int g = 0; g < 4; ++g) {
-        const int k = g * 2;
-        const u32x2 pk = {cvt_pk_bf16(v[k * 2], v[k * 2 + 1]),
-                          cvt_pk_bf16(v[(k + 1) * 2], v[(k + 1) * 2 + 1])};
-        *reinterpret_cast<u32x2 *>(row + g * 8) = pk;
+    for (int k = 0; k < 8; ++k) {
+        O[(size_t)q * o_stride + d0 + kCOff[k][0]] = (bf16)v[k * 2];
+        O[(size_t)q * o_stride + d0 + kCOff[k][1]] = (bf16)v[k * 2 + 1];
     }
 }
 
