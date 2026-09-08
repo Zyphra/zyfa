@@ -42,56 +42,94 @@ __device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
     o.d = mulsc(o.d, corr);
 }
 
-__device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, const st16 &vsm, float &m_, float &l_) {
+struct SmxAcc {
+    float mref, corr;
+};
+
+__device__ __forceinline__ SmxAcc smx_prep(o_tile &o, s4_tile &s, float &m_) {
     const float mx = col_max4(s);
     const float mnew = fmaxf(m_, mx);
+    SmxAcc a;
 #if RESCALE_SKIP
     const float dmax = mnew - m_;
     const int skip = __all(dmax <= RESCALE_THRESHOLD);
-    float corr = 1.f;
-    float mref = m_;
+    a.corr = 1.f;
+    a.mref = m_;
     if (!__builtin_expect(skip, 1)) {
-        corr = (dmax > 0.f) ? exp2f(-dmax) : 1.f;
+        a.corr = (dmax > 0.f) ? zk_exp2(-dmax) : 1.f;
         if (__builtin_expect(m_ != neg_inf(), 1))
-            rescale_o(o, corr);
-        mref = mnew;
+            rescale_o(o, a.corr);
+        a.mref = mnew;
         m_ = mnew;
     }
 #else
-    const float corr = (mnew > m_) ? exp2f(m_ - mnew) : 1.f;
+    a.corr = (mnew > m_) ? zk_exp2(m_ - mnew) : 1.f;
     if (__builtin_expect(m_ != neg_inf(), 1))
-        rescale_o(o, corr);
-    const float mref = mnew;
+        rescale_o(o, a.corr);
+    a.mref = mnew;
     m_ = mnew;
 #endif
+    return a;
+}
+
+__device__ __forceinline__ void smx_pv(o_tile &o, s4_tile &s, const st16 &vsm, SmxAcc a, float &l_) {
     const auto &vlo = *reinterpret_cast<const st<64, 128> *>(&vsm.data[0]);
     const auto &vhi = *reinterpret_cast<const st<64, 128> *>(&vsm.data[64 * Dv]);
-    __builtin_amdgcn_iglp_opt(2);
-    exp2_h<0>(s.a, mref);
-    __builtin_amdgcn_s_setprio(1);
+    zk_iglp_smx();
+    exp2_h<0>(s.a, a.mref);
+    zk_setprio_hi();
     mma_pv_one<0>(o, vlo, cvt8(s.a, 0));
-    exp2_h<8>(s.a, mref);
+    exp2_h<8>(s.a, a.mref);
     mma_pv_one<1>(o, vlo, cvt8(s.a, 8));
-    exp2_h<0>(s.b, mref);
+    exp2_h<0>(s.b, a.mref);
     mma_pv_one<2>(o, vlo, cvt8(s.b, 0));
-    exp2_h<8>(s.b, mref);
+    exp2_h<8>(s.b, a.mref);
     mma_pv_one<3>(o, vlo, cvt8(s.b, 8));
-    exp2_h<0>(s.c, mref);
+    exp2_h<0>(s.c, a.mref);
     mma_pv_one<0>(o, vhi, cvt8(s.c, 0));
-    exp2_h<8>(s.c, mref);
+    exp2_h<8>(s.c, a.mref);
     mma_pv_one<1>(o, vhi, cvt8(s.c, 8));
-    exp2_h<0>(s.d, mref);
+    exp2_h<0>(s.d, a.mref);
     mma_pv_one<2>(o, vhi, cvt8(s.d, 0));
-    exp2_h<8>(s.d, mref);
+    exp2_h<8>(s.d, a.mref);
     mma_pv_one<3>(o, vhi, cvt8(s.d, 8));
-    __builtin_amdgcn_s_setprio(0);
-    l_ = l_ * corr + col_sum4(s);
+    zk_setprio_lo();
+    l_ = l_ * a.corr + col_sum4(s);
+}
+
+__device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, const st16 &vsm, float &m_, float &l_) {
+    smx_pv(o, s, vsm, smx_prep(o, s, m_), l_);
+}
+
+__device__ __forceinline__ void qk_prefetch(s4_tile &att, const st16 &kcur, st16 &knx, st16 &vnx, const bf16 *gKn,
+                                           const bf16 *gVn, int kv_stride, const q_tile &qT) {
+    zero_s4(att);
+    pin_s4(att);
+    zk_iglp_qk();
+    prefetch_k_pass<0>(knx, gKn, kv_stride);
+    mma_qk_quad_c(att, kcur, 0, qT.d0);
+    mma_qk_quad_c(att, kcur, 1, qT.d1);
+    prefetch_k_pass<1>(knx, gKn, kv_stride);
+    mma_qk_quad_c(att, kcur, 2, qT.d2);
+    prefetch_v_pass<0>(vnx, gVn, kv_stride);
+    mma_qk_quad_c(att, kcur, 3, qT.d3);
+    prefetch_k_pass<2>(knx, gKn, kv_stride);
+    mma_qk_quad_c(att, kcur, 4, qT.d4);
+    prefetch_v_pass<1>(vnx, gVn, kv_stride);
+    mma_qk_quad_c(att, kcur, 5, qT.d5);
+    prefetch_k_pass<3>(knx, gKn, kv_stride);
+    mma_qk_quad_c(att, kcur, 6, qT.d6);
+    prefetch_v_pass<2>(vnx, gVn, kv_stride);
+    mma_qk_quad_c(att, kcur, 7, qT.d7);
+    prefetch_v_pass<3>(vnx, gVn, kv_stride);
+    zk_qk_group_bf16_d128();
+    zk_split_region();
 }
 
 // Bshd=false: BHSD [B,H,S,D], seq stride D (current benches).
 // Bshd=true:  BSHD [B,S,H,D], seq stride H*D. D-axis still packed.
 template <bool PairHeads, bool Bshd>
-__global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse,
+__global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse,
                                                     int M, int N, int Hq, int Hkv, float scale, int nxcd) {
     extern __shared__ Smem sm[];
     Smem &s = sm[0];
@@ -177,28 +215,9 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
             const int cur = kb & 1, nx = cur ^ 1;
             wg_bar();
             const int kb_n = (kb + 1 < max_num_tiles) ? kb + 1 : kb;
-            const bf16 *gKn = kv_tile_ptr(Kh, kb_n, kv_stride);
-            const bf16 *gVn = kv_tile_ptr(Vh, kb_n, kv_stride);
             s4_tile att;
-            zero_s4(att);
-            pin_s4(att);
-            __builtin_amdgcn_iglp_opt(0);
-            prefetch_k_pass<0>(s.k[nx], gKn, kv_stride);
-            mma_qk_quad_c(att, s.k[cur], 0, qT.d0);
-            mma_qk_quad_c(att, s.k[cur], 1, qT.d1);
-            prefetch_k_pass<1>(s.k[nx], gKn, kv_stride);
-            mma_qk_quad_c(att, s.k[cur], 2, qT.d2);
-            prefetch_v_pass<0>(s.v[nx], gVn, kv_stride);
-            mma_qk_quad_c(att, s.k[cur], 3, qT.d3);
-            prefetch_k_pass<2>(s.k[nx], gKn, kv_stride);
-            mma_qk_quad_c(att, s.k[cur], 4, qT.d4);
-            prefetch_v_pass<1>(s.v[nx], gVn, kv_stride);
-            mma_qk_quad_c(att, s.k[cur], 5, qT.d5);
-            prefetch_k_pass<3>(s.k[nx], gKn, kv_stride);
-            mma_qk_quad_c(att, s.k[cur], 6, qT.d6);
-            prefetch_v_pass<2>(s.v[nx], gVn, kv_stride);
-            mma_qk_quad_c(att, s.k[cur], 7, qT.d7);
-            prefetch_v_pass<3>(s.v[nx], gVn, kv_stride);
+            qk_prefetch(att, s.k[cur], s.k[nx], s.v[nx], kv_tile_ptr(Kh, kb_n, kv_stride),
+                        kv_tile_ptr(Vh, kb_n, kv_stride), kv_stride, qT);
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s4(att, q_start, kb);
             softmax_pv(oR, att, s.v[cur], m_, l_);

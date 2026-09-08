@@ -53,33 +53,33 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase
     float corr = 1.f;
     float mref = m_;
     if (!__builtin_expect(skip, 1)) {
-        corr = (dmax > 0.f) ? exp2f(-dmax) : 1.f;
+        corr = (dmax > 0.f) ? zk_exp2(-dmax) : 1.f;
         if (__builtin_expect(m_ != neg_inf(), 1))
             rescale_o(o, corr);
         mref = mnew;
         m_ = mnew;
     }
 #else
-    const float corr = (mnew > m_) ? exp2f(m_ - mnew) : 1.f;
+    const float corr = (mnew > m_) ? zk_exp2(m_ - mnew) : 1.f;
     if (__builtin_expect(m_ != neg_inf(), 1))
         rescale_o(o, corr);
     const float mref = mnew;
     m_ = mnew;
 #endif
-    __builtin_amdgcn_iglp_opt(2);
+    zk_iglp_smx();
     hk8::exp2_sc(s.a, scale, mref);
     hk8::exp2_sc(s.b, scale, mref);
     l_ = l_ * corr + col_sum2(s);
     const i32x8 ps = pack_p(s.a, s.b);
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     wg_bar();
-    __builtin_amdgcn_s_setprio(1);
+    zk_setprio_hi();
     mma_pv_lds_khead(o, vbase, ps, kf, k_next_off);
-    __builtin_amdgcn_s_setprio(0);
+    zk_setprio_lo();
 }
 
 template <bool PairHeads, bool Bshd>
-__global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, const unsigned char *K,
+__global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const unsigned char *Q, const unsigned char *K,
                                                     const unsigned char *V, bf16 *O, float *Lse, int M, int N, int Hq,
                                                     int Hkv, float scale, int nxcd) {
     extern __shared__ Smem sm[];
@@ -187,17 +187,19 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             const unsigned char *gVn = kv_tile_ptr(Vh, kb_n, v_stride);
             s2_tile att;
             const uint32_t k_next_off = k_off(lds_u32(s.k[nx].data), 0);
-            __builtin_amdgcn_iglp_opt(0);
+            zk_iglp_qk();
             if (warpid() < 4)
-                __builtin_amdgcn_s_setprio(1);
+                zk_setprio_hi();
             else
-                __builtin_amdgcn_s_setprio(0);
+                zk_setprio_lo();
             prefetch_k_pass<0>(s.k[nx], gKn, k_stride);
             qk_step<false>(att, kf, qT.d0, k_off(kbase, 1));
             prefetch_k_pass<1>(s.k[nx], gKn, k_stride);
             qk_step<true>(att, kf, qT.d1, k_off(kbase, 2));
             prefetch_v(s.v[nx], gVn, v_stride);
             qk_tail<true>(att, kf, qT.d2);
+            zk_qk_group_fp8_d192();
+            zk_split_region();
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s2(att, q_start, kb);
             softmax_pv(oR, att, vbase, scale, m_, l_, kf, k_next_off);

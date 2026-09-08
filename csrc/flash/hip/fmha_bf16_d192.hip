@@ -52,23 +52,23 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s_tile &s, const st_v &vsm
     float corr = 1.f;
     float mref = m_;
     if (!__builtin_expect(skip, 1)) {
-        corr = (dmax > 0.f) ? exp2f(-dmax) : 1.f;
+        corr = (dmax > 0.f) ? zk_exp2(-dmax) : 1.f;
         if (__builtin_expect(m_ != neg_inf(), 1))
             rescale_o(o, corr);
         mref = mnew;
         m_ = mnew;
     }
 #else
-    const float corr = (mnew > m_) ? exp2f(m_ - mnew) : 1.f;
+    const float corr = (mnew > m_) ? zk_exp2(m_ - mnew) : 1.f;
     if (__builtin_expect(m_ != neg_inf(), 1))
         rescale_o(o, corr);
     const float mref = mnew;
     m_ = mnew;
 #endif
     const auto &v = *reinterpret_cast<const st<64, 128> *>(&vsm);
-    __builtin_amdgcn_iglp_opt(2);
+    zk_iglp_smx();
     exp2_h<0>(s.a, mref);
-    __builtin_amdgcn_s_setprio(1);
+    zk_setprio_hi();
     mma_pv_one<0>(o, v, cvt8(s.a, 0));
     exp2_h<8>(s.a, mref);
     mma_pv_one<1>(o, v, cvt8(s.a, 8));
@@ -76,12 +76,12 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s_tile &s, const st_v &vsm
     mma_pv_one<2>(o, v, cvt8(s.b, 0));
     exp2_h<8>(s.b, mref);
     mma_pv_one<3>(o, v, cvt8(s.b, 8));
-    __builtin_amdgcn_s_setprio(0);
+    zk_setprio_lo();
     l_ = l_ * corr + col_sum2(s);
 }
 
 template <bool PairHeads, bool Bshd>
-__global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse,
+__global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse,
                                                     int M, int N, int Hq, int Hkv, float scale, int nxcd) {
     extern __shared__ Smem sm[];
     Smem &s = sm[0];
@@ -174,7 +174,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
             s_tile att;
             zero_s(att);
             pin_s(att);
-            __builtin_amdgcn_iglp_opt(0);
+            zk_iglp_qk();
             prefetch_k_pass<0>(s.k[nx], gKn, k_stride);
             mma_qk_pair_c(att, s.k[cur], 0, qT.d0);
             mma_qk_pair_c(att, s.k[cur], 1, qT.d1);
@@ -193,6 +193,8 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const bf16 *Q, const bf16 *K
             mma_qk_pair_c(att, s.k[cur], 10, qT.d10);
             prefetch_v_pass<1>(s.v[nx], gVn, v_stride);
             mma_qk_pair_c(att, s.k[cur], 11, qT.d11);
+            zk_qk_group_bf16_d192();
+            zk_split_region();
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s2(att, q_start, kb);
             softmax_pv(oR, att, s.v[cur], m_, l_);

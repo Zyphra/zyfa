@@ -7,6 +7,7 @@
 
 #include <hip/hip_runtime.h>
 #include <cstdint>
+#include "zk_llvm.h"
 
 namespace hk {
 
@@ -69,6 +70,28 @@ __device__ __forceinline__ void sched_vmem_mfma() {
     SCHED_GROUP(MFMA_MASK, MfmaCnt, Id);
     if constexpr (Pairs > 1)
         sched_vmem_mfma<Pairs - 1, MfmaCnt, Id>();
+}
+
+// Source-count match for one key block. Enabled by ZK_QK_GROUP.
+__device__ __forceinline__ void zk_qk_group_bf16_d128() {
+#if ZK_QK_GROUP
+    sched_vmem_mfma<8, 4, 0>();
+#endif
+}
+__device__ __forceinline__ void zk_qk_group_fp8_d128() {
+#if ZK_QK_GROUP
+    sched_vmem_mfma<4, 2, 0>();
+#endif
+}
+__device__ __forceinline__ void zk_qk_group_bf16_d192() {
+#if ZK_QK_GROUP
+    sched_vmem_mfma<6, 4, 0>();
+#endif
+}
+__device__ __forceinline__ void zk_qk_group_fp8_d192() {
+#if ZK_QK_GROUP
+    sched_vmem_mfma<4, 2, 0>();
+#endif
 }
 
 // HK/aiter G2S: buffer_load_dwordx4 … lds (SGPR rsrc + 32-bit voffset).
@@ -210,7 +233,7 @@ __device__ __forceinline__ void mma_pv_s(o_tile &o, const kv_tile &v, const s_ti
 __device__ __forceinline__ fx16 exp2_fx(fx16 v) {
 #pragma unroll
     for (int r = 0; r < 16; ++r)
-        v[r] = exp2f(v[r]);
+        v[r] = zk_exp2(v[r]);
     return v;
 }
 __device__ __forceinline__ void exp2_frag(s_tile &s, int i) {

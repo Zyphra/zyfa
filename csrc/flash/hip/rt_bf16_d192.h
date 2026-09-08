@@ -151,8 +151,8 @@ __device__ __forceinline__ void exp2_h(fx16 &s, float mnew) {
     for (int i = 0; i < 4; ++i) {
         f2 v = {s[OFF + 2 * i], s[OFF + 2 * i + 1]};
         v = v + nm;
-        s[OFF + 2 * i] = exp2f(v[0]);
-        s[OFF + 2 * i + 1] = exp2f(v[1]);
+        s[OFF + 2 * i] = zk_exp2(v[0]);
+        s[OFF + 2 * i + 1] = zk_exp2(v[1]);
     }
 }
 
@@ -181,8 +181,8 @@ __device__ __forceinline__ void exp2_m(fx16 &s, float mnew) {
     for (int i = 0; i < 8; ++i) {
         f2 v = {s[2 * i], s[2 * i + 1]};
         asm volatile("v_pk_add_f32 %0, %1, %2" : "+v"(v) : "v"(nm));
-        s[2 * i] = exp2f(v[0]);
-        s[2 * i + 1] = exp2f(v[1]);
+        s[2 * i] = zk_exp2(v[0]);
+        s[2 * i + 1] = zk_exp2(v[1]);
     }
 }
 

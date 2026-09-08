@@ -431,8 +431,8 @@ __device__ __forceinline__ void exp2_sc(fx16 &s, float scale, float mnew) {
     for (int i = 0; i < 8; ++i) {
         f2 v = {s[2 * i], s[2 * i + 1]};
         asm volatile("v_pk_fma_f32 %0, %0, %1, %2" : "+v"(v) : "v"(sc), "v"(nm));
-        s[2 * i] = exp2f(v[0]);
-        s[2 * i + 1] = exp2f(v[1]);
+        s[2 * i] = zk_exp2(v[0]);
+        s[2 * i + 1] = zk_exp2(v[1]);
     }
 }
 

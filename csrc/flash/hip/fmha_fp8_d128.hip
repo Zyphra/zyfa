@@ -59,7 +59,7 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
         // O *= corr runs after the score exps, same as their .co.
         float delta = m_ - mnew;
         delta = (m_ == neg_inf()) ? 0.f : delta;
-        corr = exp2f(delta);
+        corr = zk_exp2(delta);
         mref = mnew;
         m_ = mnew;
     }
@@ -68,14 +68,14 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     // same corr = exp2(m_old - m_new) in this convention.
     float delta = m_ - mnew;
     delta = (m_ == neg_inf()) ? 0.f : delta;
-    const float corr = exp2f(delta);
+    const float corr = zk_exp2(delta);
     const float mref = mnew;
     m_ = mnew;
 #endif
     // Current V is already in LDS (prior tile bar). First 4 PV run under
     // exp(c,d); vmcnt+bar only before next-K issue in the last 4 PV.
     pv_v_head vh = preissue_pv_v(vbase, 0);
-    __builtin_amdgcn_iglp_opt(2);
+    zk_iglp_smx();
     exp2_sc(s.a, scale, mref);
     exp2_sc(s.b, scale, mref);
     const float sum_ab = sum2_local(s.a, s.b);
@@ -91,19 +91,19 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
 #else
     rescale_o_aiter(o, corr);
 #endif
-    __builtin_amdgcn_s_setprio(1);
+    zk_setprio_hi();
     mma_pv_lds_preissued(o, vbase, p_lo, 0, vh);
-    __builtin_amdgcn_s_setprio(0);
+    zk_setprio_lo();
     const i32x8 p_hi = pack_p_consume(s.c, s.d);
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     wg_bar();
-    __builtin_amdgcn_s_setprio(1);
+    zk_setprio_hi();
     mma_pv_lds_khead(o, vbase, p_hi, 2, kf, k_next_off);
-    __builtin_amdgcn_s_setprio(0);
+    zk_setprio_lo();
 }
 
 template <bool PairHeads>
-__global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, const unsigned char *K,
+__global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const unsigned char *Q, const unsigned char *K,
                                                     const unsigned char *V, bf16 *O, float *Lse, int M, int N,
                                                     int Hq, int Hkv, float scale, int nxcd, int q_stride,
                                                     int kv_stride, int bshd) {
@@ -204,11 +204,11 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             s4_tile att;
             const uint32_t off0 = k_off(kbase, 0), off1 = k_off(kbase, 1);
             const uint32_t k_next_off = k_off(lds_u32(s.k[nx].data), 0);
-            __builtin_amdgcn_iglp_opt(0);
+            zk_iglp_qk();
             if (warpid() < 4)
-                __builtin_amdgcn_s_setprio(1);
+                zk_setprio_hi();
             else
-                __builtin_amdgcn_s_setprio(0);
+                zk_setprio_lo();
             prefetch_k_pass<0>(s.k[nx], gKn, kv_stride);
             qk_step<false, 8192>(att, kf, qT.d0, 0, off0);
             prefetch_k_pass<1>(s.k[nx], gKn, kv_stride);
@@ -219,6 +219,8 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             const bool causal_tile = q_start < (kb + 1) * KV_BLOCK;
             float mx_ab = neg_inf();
             qk_tail<true, true>(att, kf, qT.d1, 2, &mx_ab);
+            zk_qk_group_fp8_d128();
+            zk_split_region();
             if (__builtin_expect(causal_tile, 0))
                 mask_s4(att, q_start, kb);
             // Causal tiles must re-reduce after mask (pre-mask max includes
