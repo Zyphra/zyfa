@@ -34,9 +34,11 @@ __device__ __forceinline__ const unsigned char *kv_tile_ptr(const unsigned char 
     return base + (size_t)tile * KV_BLOCK * seq_stride;
 }
 
-__device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
-    if (!__any(corr != 1.f))
-        return;
+// AITER fwd_hd128_fp8_causal.co: no Δm skip. After the 64 score v_exp,
+// corr = exp2(scale*(m_old-m_new)) with v_cndmask(delta, 0) on the
+// first-tile sentinel, then l *= corr, sum P, 64 v_mul on O, then PV.
+// Always issue the O muls (corr=1 is exp2(0)); no __all / __any.
+__device__ __forceinline__ void rescale_o_aiter(o_tile &o, float corr) {
     o.a = mulsc(o.a, corr);
     o.b = mulsc(o.b, corr);
     o.c = mulsc(o.c, corr);
@@ -44,8 +46,8 @@ __device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
 }
 
 __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase, float scale, float &m_, float &l_,
-                                          k_frag &kf, uint32_t k_next_off) {
-    const float mx = col_max4_sc(s, scale);
+                                          k_frag &kf, uint32_t k_next_off, bool have_mx_ab, float mx_ab) {
+    const float mx = have_mx_ab ? col_max4_sc_finish(s, mx_ab, scale) : col_max4_sc(s, scale);
     const float mnew = fmaxf(m_, mx);
 #if RESCALE_SKIP
     const float dmax = mnew - m_;
@@ -53,16 +55,20 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     float corr = 1.f;
     float mref = m_;
     if (!__builtin_expect(skip, 1)) {
-        corr = exp2f(-dmax);
-        if (__builtin_expect(m_ != neg_inf(), 1))
-            rescale_o(o, corr);
+        // AITER corr: cndmask first-tile delta to 0 → exp2(0)=1.
+        // O *= corr runs after the score exps, same as their .co.
+        float delta = m_ - mnew;
+        delta = (m_ == neg_inf()) ? 0.f : delta;
+        corr = exp2f(delta);
         mref = mnew;
         m_ = mnew;
     }
 #else
-    const float corr = exp2f(m_ - mnew);
-    if (__builtin_expect(m_ != neg_inf(), 1))
-        rescale_o(o, corr);
+    // m_ is already scaled. AITER keeps raw max and multiplies by s26;
+    // same corr = exp2(m_old - m_new) in this convention.
+    float delta = m_ - mnew;
+    delta = (m_ == neg_inf()) ? 0.f : delta;
+    const float corr = exp2f(delta);
     const float mref = mnew;
     m_ = mnew;
 #endif
@@ -74,12 +80,20 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     exp2_sc(s.b, scale, mref);
     const float sum_ab = sum2_local(s.a, s.b);
     const i32x8 p_lo = pack_p_consume(s.a, s.b);
-    __builtin_amdgcn_s_setprio(1);
-    mma_pv_lds_preissued(o, vbase, p_lo, 0, vh);
-    __builtin_amdgcn_s_setprio(0);
+    // Force exp(c,d) before the first 4 PV so VALU sits under those MFMAs.
+    // Source order was PV then exp; setprio around PV blocked the overlap.
     exp2_sc(s.c, scale, mref);
     exp2_sc(s.d, scale, mref);
     l_ = l_ * corr + xor32_sum(sum_ab + sum2_local(s.c, s.d));
+#if RESCALE_SKIP
+    if (!__builtin_expect(skip, 1))
+        rescale_o_aiter(o, corr);
+#else
+    rescale_o_aiter(o, corr);
+#endif
+    __builtin_amdgcn_s_setprio(1);
+    mma_pv_lds_preissued(o, vbase, p_lo, 0, vh);
+    __builtin_amdgcn_s_setprio(0);
     const i32x8 p_hi = pack_p_consume(s.c, s.d);
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     wg_bar();
@@ -202,10 +216,14 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
             prefetch_v_pass<0>(s.v[nx], gVn, kv_stride);
             qk_step<true, 8192>(att, kf, qT.d1, 0, off1);
             prefetch_v_pass<1>(s.v[nx], gVn, kv_stride);
-            qk_tail<true>(att, kf, qT.d1, 2);
-            if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
+            const bool causal_tile = q_start < (kb + 1) * KV_BLOCK;
+            float mx_ab = neg_inf();
+            qk_tail<true, true>(att, kf, qT.d1, 2, &mx_ab);
+            if (__builtin_expect(causal_tile, 0))
                 mask_s4(att, q_start, kb);
-            softmax_pv(oR, att, vbase, scale, m_, l_, kf, k_next_off);
+            // Causal tiles must re-reduce after mask (pre-mask max includes
+            // future keys). Hot tiles finish c,d on top of the folded a,b max.
+            softmax_pv(oR, att, vbase, scale, m_, l_, kf, k_next_off, !causal_tile, mx_ab);
         };
 
         int kb = 0;

@@ -269,9 +269,13 @@ __device__ __forceinline__ void qk_step(s4_tile &s, k_frag &f, const i32x8 &qb, 
     issue_k_b<NextBase>(f, next_off);
 }
 
+__device__ __forceinline__ float max2_local(fx16 &a, fx16 &b, float mx);
+
 // Last QK pair: no next-K issue (PV refills k_frag). Keep wait on hi.
-template <bool Acc>
-__device__ __forceinline__ void qk_tail(s4_tile &s, k_frag &f, const i32x8 &qb, int nk0) {
+// MaxAB: fold col_max(s.a,s.b) under the first tail MFMA. a,b are final
+// after the third QK pair; the VALU max is a recognized MFMA RAW hazard.
+template <bool Acc, bool MaxAB = false>
+__device__ __forceinline__ void qk_tail(s4_tile &s, k_frag &f, const i32x8 &qb, int nk0, float *mx_ab = nullptr) {
     fx16 &lo = nk0 ? s.c : s.a;
     fx16 &hi = nk0 ? s.d : s.b;
     asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(f.a0), "+v"(f.a1), "+v"(f.b0), "+v"(f.b1));
@@ -279,6 +283,12 @@ __device__ __forceinline__ void qk_tail(s4_tile &s, k_frag &f, const i32x8 &qb, 
         lo = kh_mma(pack8(f.a0, f.a1), qb, lo);
     else
         lo = kh_mma0(pack8(f.a0, f.a1), qb);
+    if constexpr (MaxAB) {
+        // Keep a,b in their MFMA dests. A by-value copy can be hoisted
+        // ahead of the third QK pair and miss the scoreboard.
+        SCHED_FENCE();
+        *mx_ab = max2_local(s.a, s.b, *mx_ab);
+    }
     asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(f.b0), "+v"(f.b1));
     if constexpr (Acc)
         hi = kh_mma(pack8(f.b0, f.b1), qb, hi);
@@ -377,14 +387,37 @@ __device__ __forceinline__ void mask_s4(s4_tile &s, int q_start, int kb) {
         s.d = mask_half(s.d, rb, q_pos, k_base + 96, ninf);
 }
 
+__device__ __forceinline__ float max2_local(fx16 &a, fx16 &b, float mx) {
+    asm volatile("" : "+v"(a), "+v"(b), "+v"(mx));
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        const float ar = a[r], br = b[r];
+        asm volatile("v_max3_f32 %0, %1, %2, %0" : "+v"(mx) : "v"(ar), "v"(br), "v"(a), "v"(b));
+    }
+    return mx;
+}
+
 __device__ __forceinline__ float col_max4_sc(const s4_tile &s, float scale) {
     // scale is positive for attention. max(scale*x) == scale*max(x),
     // so keep the reduction in raw QK space and pay one multiply after
     // the cross-half reduction instead of 64 multiplies per lane.
+    // One loop over a,b,c,d — do not split into max(a,b) then max(c,d)
+    // or LLVM hoists the first half ahead of the last QK MFMAs.
     float mx = neg_inf();
 #pragma unroll
     for (int r = 0; r < 16; ++r)
         mx = max3(max3(s.a[r], s.b[r], s.c[r]), s.d[r], mx);
+    return xor32_max(mx) * scale;
+}
+
+// Hot path: mx_ab already folded under qk_tail. Finish c,d after they land.
+// Simple max3 — do not use the pinned max2_local here; those extra deps
+// lengthen the remaining wall. qk_tail already waited out a,b.
+__device__ __forceinline__ float col_max4_sc_finish(s4_tile &s, float mx_ab, float scale) {
+    float mx = mx_ab;
+#pragma unroll
+    for (int r = 0; r < 16; ++r)
+        mx = max3(s.c[r], s.d[r], mx);
     return xor32_max(mx) * scale;
 }
 
