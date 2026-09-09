@@ -261,14 +261,28 @@ static void run(const unsigned char *Q, const unsigned char *K, const unsigned c
     const int q_stride = bshd ? Hq * D : D;
     const int kv_stride = bshd ? Hkv * D : D;
     const int bshd_i = bshd ? 1 : 0;
-    if (pair_heads) {
+    const bool split = B > 1 && M >= 8192;
+    const int batches = split ? B : 1;
+    const int grid = nq_pairs * nheads * (split ? 1 : B);
+    const size_t q_batch = bshd ? (size_t)M * Hq * D : (size_t)Hq * M * D;
+    const size_t kv_batch = bshd ? (size_t)N * Hkv * D : (size_t)Hkv * N * D;
+    if (pair_heads)
         hipFuncSetAttribute((const void *)attend_ker<true>, hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        attend_ker<true><<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd,
-                                                                     q_stride, kv_stride, bshd_i);
-    } else {
+    else
         hipFuncSetAttribute((const void *)attend_ker<false>, hipFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        attend_ker<false><<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd,
-                                                                      q_stride, kv_stride, bshd_i);
+    // S>=8K: one B=1 grid per batch (fused B>1 thrashes XCD L2). Short S keeps one grid.
+    for (int b = 0; b < batches; ++b) {
+        const unsigned char *Qb = Q + b * q_batch;
+        const unsigned char *Kb = K + b * kv_batch;
+        const unsigned char *Vb = V + b * kv_batch;
+        bf16 *Ob = O + b * q_batch;
+        float *Lb = Lse ? Lse + (size_t)b * Hq * M : nullptr;
+        if (pair_heads)
+            attend_ker<true><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd, q_stride,
+                                                         kv_stride, bshd_i);
+        else
+            attend_ker<false><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd, q_stride,
+                                                          kv_stride, bshd_i);
     }
 }
 

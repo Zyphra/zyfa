@@ -241,26 +241,43 @@ static void run(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse
     const int nxcd = fmha_num_xcds();
     const size_t smem = sizeof(Smem);
     const int nheads = pair_heads ? (Hq / 2) : Hq;
-    if (pair_heads && bshd) {
+    constexpr int D = 128;
+    const bool split = B > 1 && M >= 8192;
+    const int batches = split ? B : 1;
+    const int grid = nq_pairs * nheads * (split ? 1 : B);
+    const size_t q_batch = bshd ? (size_t)M * Hq * D : (size_t)Hq * M * D;
+    const size_t kv_batch = bshd ? (size_t)N * Hkv * D : (size_t)Hkv * N * D;
+    if (pair_heads && bshd)
         hipFuncSetAttribute((const void *)attend_ker<true, true>, hipFuncAttributeMaxDynamicSharedMemorySize,
                             (int)smem);
-        attend_ker<true, true>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
-    } else if (pair_heads) {
+    else if (pair_heads)
         hipFuncSetAttribute((const void *)attend_ker<true, false>, hipFuncAttributeMaxDynamicSharedMemorySize,
                             (int)smem);
-        attend_ker<true, false>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
-    } else if (bshd) {
+    else if (bshd)
         hipFuncSetAttribute((const void *)attend_ker<false, true>, hipFuncAttributeMaxDynamicSharedMemorySize,
                             (int)smem);
-        attend_ker<false, true>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
-    } else {
+    else
         hipFuncSetAttribute((const void *)attend_ker<false, false>, hipFuncAttributeMaxDynamicSharedMemorySize,
                             (int)smem);
-        attend_ker<false, false>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    // S>=8K: one B=1 grid per batch. Short S keeps one fused grid.
+    for (int b = 0; b < batches; ++b) {
+        const bf16 *Qb = Q + b * q_batch;
+        const bf16 *Kb = K + b * kv_batch;
+        const bf16 *Vb = V + b * kv_batch;
+        bf16 *Ob = O + b * q_batch;
+        float *Lb = Lse ? Lse + (size_t)b * Hq * M : nullptr;
+        if (pair_heads && bshd)
+            attend_ker<true, true>
+                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+        else if (pair_heads)
+            attend_ker<true, false>
+                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+        else if (bshd)
+            attend_ker<false, true>
+                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+        else
+            attend_ker<false, false>
+                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
     }
 }
 
