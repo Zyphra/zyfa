@@ -7,7 +7,7 @@
 //   ZK_SETPRIO       0 off, 1 emit s_setprio (constant 0/1 only)
 //   ZK_SPLIT_REGION  1 emit sched_barrier(0) between QK and softmax
 //   ZK_QK_GROUP      1 emit sched_group_barrier after QK (counts are per-kernel)
-//   ZK_EXP_BUILTIN    1 shipped: __builtin_amdgcn_exp2f; 0 = libm exp2f
+//   ZK_EXP_BUILTIN    1 default: __builtin_amdgcn_exp2f; 0 = libm exp2f
 //   ZK_LAUNCH_BLOCKS  1 (us) or 2 (HK attn __launch_bounds__ min blocks)
 
 #ifndef ZK_IGLP_QK
@@ -63,9 +63,9 @@ __device__ __forceinline__ void zk_split_region() {
 }
 
 __device__ __forceinline__ float zk_exp2(float x) {
-#if ZK_EXP_BUILTIN
-    return __builtin_amdgcn_exp2f(x);
-#else
+#if ZK_EXP_BUILTIN == 0
     return exp2f(x);
+#else
+    return __builtin_amdgcn_exp2f(x);
 #endif
 }
