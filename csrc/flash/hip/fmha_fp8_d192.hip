@@ -234,22 +234,41 @@ static void run(const unsigned char *Q, const unsigned char *K, const unsigned c
     const int nxcd = fmha_num_xcds();
     const size_t smem = sizeof(Smem);
     const int nheads = pair_heads ? (Hq / 2) : Hq;
-    if (pair_heads && bshd) {
+    constexpr int D = 192, Dv = 128;
+    bool split = B > 1 && M >= 8192;
+    if (const char *e = std::getenv("ZK_FMHA_FUSE_B"); e && std::atoi(e) == 1)
+        split = false;
+    const int batches = split ? B : 1;
+    const int n_head_units = nheads * (split ? 1 : B);
+    const int grid = nq_pairs * n_head_units;
+    const size_t q_batch = bshd ? (size_t)M * Hq * D : (size_t)Hq * M * D;
+    const size_t k_batch = bshd ? (size_t)N * Hkv * D : (size_t)Hkv * N * D;
+    const size_t v_batch = bshd ? (size_t)N * Hkv * Dv : (size_t)Hkv * N * Dv;
+    const size_t o_batch = bshd ? (size_t)M * Hq * Dv : (size_t)Hq * M * Dv;
+    if (pair_heads && bshd)
         hipFuncSetAttribute((const void *)attend_ker<true, true>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
-        attend_ker<true, true>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
-    } else if (pair_heads) {
+    else if (pair_heads)
         hipFuncSetAttribute((const void *)attend_ker<true, false>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
-        attend_ker<true, false>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
-    } else if (bshd) {
+    else if (bshd)
         hipFuncSetAttribute((const void *)attend_ker<false, true>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
-        attend_ker<false, true>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
-    } else {
+    else
         hipFuncSetAttribute((const void *)attend_ker<false, false>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
-        attend_ker<false, false>
-            <<<nq_pairs * B * nheads, NT, smem, stream>>>(Q, K, V, O, Lse, M, N, Hq, Hkv, scale, nxcd);
+    // S>=8K: one B=1 grid per batch. Short S keeps one fused grid.
+    // Full grid (no persist loop): a job loop in attend_ker breaks pack_p bitwise.
+    for (int b = 0; b < batches; ++b) {
+        const unsigned char *Qb = Q + b * q_batch;
+        const unsigned char *Kb = K + b * k_batch;
+        const unsigned char *Vb = V + b * v_batch;
+        bf16 *Ob = O + b * o_batch;
+        float *Lb = Lse ? Lse + (size_t)b * Hq * M : nullptr;
+        if (pair_heads && bshd)
+            attend_ker<true, true><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+        else if (pair_heads)
+            attend_ker<true, false><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+        else if (bshd)
+            attend_ker<false, true><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+        else
+            attend_ker<false, false><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
     }
 }
 

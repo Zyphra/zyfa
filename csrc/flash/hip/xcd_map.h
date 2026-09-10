@@ -7,8 +7,7 @@
 #include <cstdlib>
 #include <hip/hip_runtime.h>
 
-__device__ __forceinline__ void fmha_xcd_map(int nq_pairs, int BH, int nxcd, int &qx, int &bh) {
-    const int i = (int)blockIdx.x;
+__device__ __forceinline__ void fmha_xcd_map(int nq_pairs, int BH, int nxcd, int &qx, int &bh, int i) {
     if (nxcd <= 1) {
         qx = i % nq_pairs;
         bh = i / nq_pairs;
@@ -23,6 +22,10 @@ __device__ __forceinline__ void fmha_xcd_map(int nq_pairs, int BH, int nxcd, int
     const int L = off + seq;
     qx = L % nq_pairs;
     bh = L / nq_pairs;
+}
+
+__device__ __forceinline__ void fmha_xcd_map(int nq_pairs, int BH, int nxcd, int &qx, int &bh) {
+    fmha_xcd_map(nq_pairs, BH, nxcd, qx, bh, (int)blockIdx.x);
 }
 
 __host__ inline int fmha_num_xcds() {
@@ -42,4 +45,28 @@ __host__ inline int fmha_num_xcds() {
     }
     cached = n;
     return n;
+}
+
+// DeepSeek-style persistent grid: one WG per CU (multiple of nxcd so
+// grid-stride keeps block i on XCD i % nxcd). No atomics.
+__host__ inline int fmha_num_cus() {
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+    int n = 256;
+    int dev = 0, v = 0;
+    if (hipGetDevice(&dev) == hipSuccess &&
+        hipDeviceGetAttribute(&v, hipDeviceAttributeMultiprocessorCount, dev) == hipSuccess && v > 0)
+        n = v;
+    cached = n;
+    return n;
+}
+
+__host__ inline int fmha_persist_grid(int n_work, int nxcd) {
+    const int nxc = nxcd > 1 ? nxcd : 1;
+    int cap = fmha_num_cus();
+    cap -= cap % nxc;
+    if (cap < nxc)
+        cap = nxc;
+    return n_work < cap ? n_work : cap;
 }

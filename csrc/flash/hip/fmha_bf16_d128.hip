@@ -130,7 +130,8 @@ __device__ __forceinline__ void qk_prefetch(s4_tile &att, const st16 &kcur, st16
 // Bshd=true:  BSHD [B,S,H,D], seq stride H*D. D-axis still packed.
 template <bool PairHeads, bool Bshd>
 __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse,
-                                                    int M, int N, int Hq, int Hkv, float scale, int nxcd) {
+                                                    int M, int N, int Hq, int Hkv, float scale, int nxcd,
+                                                    int n_head_units) {
     extern __shared__ Smem sm[];
     Smem &s = sm[0];
 
@@ -141,9 +142,13 @@ __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const bf16 *Q
     constexpr int QW = PairHeads ? (NW / 2) : NW;
     const int numQ = (M / Q_BLOCK + QW - 1) / QW;
     const int nq_pairs = (numQ + 1) / 2;
-    const int n_head_units = (int)gridDim.x / nq_pairs;
+    const int n_jobs = nq_pairs * n_head_units;
+    const int stride = (int)gridDim.x;
+    const int num_tiles = N / KV_BLOCK;
+
+    for (int job = (int)blockIdx.x; job < n_jobs; job += stride) {
     int qx, hu;
-    fmha_xcd_map(nq_pairs, n_head_units, nxcd, qx, hu);
+    fmha_xcd_map(nq_pairs, n_head_units, nxcd, qx, hu, job);
 
     int batch_idx, head_idx, head_kv, qwarp;
     if constexpr (PairHeads) {
@@ -183,7 +188,6 @@ __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const bf16 *Q
     }
     float *Lh = Lse ? Lse + ((size_t)batch_idx * Hq + head_idx) * M : nullptr;
 
-    const int num_tiles = N / KV_BLOCK;
     const int q_lo = qx, q_hi = numQ - 1 - qx;
 
     for (int pp = 0; pp < 2; ++pp) {
@@ -229,6 +233,7 @@ __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const bf16 *Q
             store_lse(Lh, q_start, M, lse);
         }
     }
+    }
 }
 
 static void run(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse, int M, int N, int B, int Hq, int Hkv,
@@ -242,9 +247,12 @@ static void run(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse
     const size_t smem = sizeof(Smem);
     const int nheads = pair_heads ? (Hq / 2) : Hq;
     constexpr int D = 128;
-    const bool split = B > 1 && M >= 8192;
+    bool split = B > 1 && M >= 8192;
+    if (const char *e = std::getenv("ZK_FMHA_FUSE_B"); e && std::atoi(e) == 1)
+        split = false;
     const int batches = split ? B : 1;
-    const int grid = nq_pairs * nheads * (split ? 1 : B);
+    const int n_head_units = nheads * (split ? 1 : B);
+    const int grid = fmha_persist_grid(nq_pairs * n_head_units, nxcd);
     const size_t q_batch = bshd ? (size_t)M * Hq * D : (size_t)Hq * M * D;
     const size_t kv_batch = bshd ? (size_t)N * Hkv * D : (size_t)Hkv * N * D;
     if (pair_heads && bshd)
@@ -268,16 +276,16 @@ static void run(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse
         float *Lb = Lse ? Lse + (size_t)b * Hq * M : nullptr;
         if (pair_heads && bshd)
             attend_ker<true, true>
-                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd, n_head_units);
         else if (pair_heads)
             attend_ker<true, false>
-                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd, n_head_units);
         else if (bshd)
             attend_ker<false, true>
-                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd, n_head_units);
         else
             attend_ker<false, false>
-                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+                <<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd, n_head_units);
     }
 }
 
