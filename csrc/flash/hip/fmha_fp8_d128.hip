@@ -5,6 +5,9 @@
 #ifndef RESCALE_SKIP
 #define RESCALE_SKIP true
 #endif
+#ifndef ZK_EXP_SCHRAUDOLPH
+#define ZK_EXP_SCHRAUDOLPH 1
+#endif
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
