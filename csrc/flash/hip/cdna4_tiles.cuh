@@ -1,5 +1,5 @@
 #pragma once
-// Slim HipKittens for official bf16 d128 attend_ker.
+// Slim CDNA4 tile include for official bf16 d128 attend_ker.
 // CDNA4 only. No cdna3, cdna5, pyutils, warp-shared, or group-vec.
 #ifndef KITTENS_CDNA4
 #define KITTENS_CDNA4

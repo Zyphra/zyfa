@@ -2,7 +2,7 @@
 // Official bf16 D=128: HipKittens attend_ker (KN=64, 8-wave ping-pong).
 // Native BHSD and BSHD (no host transposes). DeepSeek persist: one WG/CU
 // + inner job walk. Old streamed KN=128 is experimental/fmha_bf16_d128_old.hip.
-#include "hipkittens.cuh"
+#include "cdna4_tiles.cuh"
 #include "xcd_map.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
