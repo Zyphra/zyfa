@@ -235,9 +235,7 @@ static void run(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse
     const size_t smem = sizeof(Smem);
     const int nheads = pair_heads ? (Hq / 2) : Hq;
     constexpr int D = 192, Dv = 128;
-    bool split = B > 1 && M >= 8192;
-    if (const char *e = std::getenv("ZK_FMHA_FUSE_B"); e && std::atoi(e) == 1)
-        split = false;
+    const bool split = fmha_split_batch(B, nq_pairs, nheads, nxcd);
     const int batches = split ? B : 1;
     const int n_head_units = nheads * (split ? 1 : B);
     const int grid = fmha_persist_grid(nq_pairs * n_head_units, nxcd);
@@ -253,7 +251,7 @@ static void run(const bf16 *Q, const bf16 *K, const bf16 *V, bf16 *O, float *Lse
         hipFuncSetAttribute((const void *)attend_ker<false, true>, hipFuncAttributeMaxDynamicSharedMemorySize, 131072);
     else
         hipFuncSetAttribute((const void *)attend_ker<false, false>, hipFuncAttributeMaxDynamicSharedMemorySize, 131072);
-    // S>=8K: one B=1 grid per batch. Short S keeps one fused grid.
+    // Split B only when one batch already fills the persist CU cap.
     for (int b = 0; b < batches; ++b) {
         const bf16 *Qb = Q + b * q_batch;
         const bf16 *Kb = K + b * k_batch;

@@ -4,7 +4,7 @@
 // + inner job walk. Old streamed KN=128 is experimental/fmha_bf16_d128_old.hip.
 #include "cdna4_tiles.cuh"
 #include "xcd_map.h"
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include <torch/extension.h>
 #include <cstdint>
 #include <cstdlib>
@@ -962,9 +962,11 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     auto O = bshd ? torch::empty({B, M, Hq, Dv}, q.options().dtype(at::kBFloat16))
                   : torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kBFloat16));
     torch::Tensor Lse = torch::empty({B, Hq, 1, M}, q.options().dtype(at::kFloat));
-    bool split = B > 1 && M >= 8192;
-    if (const char *e = std::getenv("ZK_FMHA_FUSE_B"); e && std::atoi(e) == 1)
-        split = false;
+    const int numQ = (M / Q_BLOCK_SIZE + NUM_WARPS - 1) / NUM_WARPS;
+    int nq_map = (numQ + 1) / 2;
+    if (const char *e = std::getenv("ZK_FMHA_NO_PAIR"); e && std::atoi(e) == 1)
+        nq_map = numQ;
+    const bool split = fmha_split_batch(B, nq_map, Hq, fmha_num_xcds());
     const int batches = split ? B : 1;
     const int B_launch = split ? 1 : B;
     const size_t q_batch = (size_t)M * Hq * D;

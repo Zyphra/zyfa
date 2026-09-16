@@ -398,8 +398,8 @@ struct alignas(16) st {
 };
 
 #define HK_GLD16(g, l) __builtin_amdgcn_global_load_lds(                                           \
-    (const __attribute__((address_space(1))) void *)(g),                                           \
-    (__attribute__((address_space(3))) void *)(l), 16, 0, 0)
+    (__attribute__((address_space(1))) void *)(void *)(g),                                         \
+    (__attribute__((address_space(3))) void *)(void *)(l), 16, 0, 0)
 
 // fmha32 K bank-swizzle. 64x128 bf16, 16 chunks/row.
 // Write: logical chunk L lives at physical P = (L + key) % 16.
