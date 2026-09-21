@@ -966,7 +966,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     int nq_map = (numQ + 1) / 2;
     if (const char *e = std::getenv("ZK_FMHA_NO_PAIR"); e && std::atoi(e) == 1)
         nq_map = numQ;
-    const bool split = fmha_split_batch(B, nq_map, Hq, fmha_num_xcds());
+    const bool split = fmha_split_batch(B, nq_map, Hq, fmha_num_xcds(), M);
     const int batches = split ? B : 1;
     const int B_launch = split ? 1 : B;
     const size_t q_batch = (size_t)M * Hq * D;

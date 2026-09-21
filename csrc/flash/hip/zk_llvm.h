@@ -11,6 +11,11 @@
 //   ZK_EXP_SCHRAUDOLPH  0 default. 1 = fused IEEE exp2 in zk_exp2_fma2 only
 //                     (FP8 D=128 scores). zk_exp2 stays hardware: BF16 and
 //                     rescale corr did not gain (MLA BF16 regressed).
+//   ZK_EXP_SCHRAUDOLPH_FP8  0 default. 1 = E4M3-direct Schraudolph in
+//                     zk_exp2_fma2 (bit = 8x+56, codes as f32). pack_p
+//                     shift-packs the bytes; col_sum decodes with
+//                     cvt_f32_fp8. Wins over ZK_EXP_SCHRAUDOLPH when both
+//                     are set.
 //   ZK_LAUNCH_BLOCKS   1 (us) or 2 (HK attn __launch_bounds__ min blocks)
 
 #ifndef ZK_IGLP_QK
@@ -33,6 +38,9 @@
 #endif
 #ifndef ZK_EXP_SCHRAUDOLPH
 #define ZK_EXP_SCHRAUDOLPH 0
+#endif
+#ifndef ZK_EXP_SCHRAUDOLPH_FP8
+#define ZK_EXP_SCHRAUDOLPH_FP8 0
 #endif
 #ifndef ZK_LAUNCH_BLOCKS
 #define ZK_LAUNCH_BLOCKS 1
@@ -83,7 +91,20 @@ __device__ __forceinline__ float zk_exp2(float x) {
 // 2^(a*x + b) in one packed FMA in IEEE exponent space.
 // Hot path: a = scale, b = -mnew. Off: scale FMA then zk_exp2.
 __device__ __forceinline__ zk_f2 zk_exp2_fma2(zk_f2 x, float a, float b) {
-#if ZK_EXP_SCHRAUDOLPH
+#if ZK_EXP_SCHRAUDOLPH_FP8
+    // E4M3 Schraudolph: 3 mantissa bits, bias 7 → bit = 8*(a x + b) + 56.
+    // Clamp off NaN (127) and negatives. Returns the code in [0,126] as
+    // f32; pack_p shift-packs those bytes (no cvt_pk).
+    constexpr float A = 8.f;
+    constexpr float B = 56.f;
+    const zk_f2 mul = {a * A, a * A};
+    const float bias = B + b * A;
+    const zk_f2 add = {bias, bias};
+    asm volatile("v_pk_fma_f32 %0, %0, %1, %2" : "+v"(x) : "v"(mul), "v"(add));
+    x[0] = fminf(fmaxf(x[0], 0.f), 126.f);
+    x[1] = fminf(fmaxf(x[1], 0.f), 126.f);
+    return x;
+#elif ZK_EXP_SCHRAUDOLPH
     constexpr float A = 8388608.f;
     constexpr float B = 1065353216.f;
     const zk_f2 mul = {a * A, a * A};

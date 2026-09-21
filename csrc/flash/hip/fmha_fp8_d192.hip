@@ -235,7 +235,7 @@ static void run(const unsigned char *Q, const unsigned char *K, const unsigned c
     const size_t smem = sizeof(Smem);
     const int nheads = pair_heads ? (Hq / 2) : Hq;
     constexpr int D = 192, Dv = 128;
-    const bool split = fmha_split_batch(B, nq_pairs, nheads, nxcd);
+    const bool split = fmha_split_batch(B, nq_pairs, nheads, nxcd, M);
     const int batches = split ? B : 1;
     const int n_head_units = nheads * (split ? 1 : B);
     const int grid = nq_pairs * n_head_units;

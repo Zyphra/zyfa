@@ -76,11 +76,15 @@ __host__ inline int fmha_persist_grid(int n_work, int nxcd) {
     return n_work < cap ? n_work : cap;
 }
 
-// Split B>1 into B=1 launches only when one batch already saturates the persist
-// CU cap. Fusing when nq_pairs*nheads < cap occupies idle CUs (B=4 H=8 S=8K
-// is 128 jobs). ZK_FMHA_FUSE_B=1 forces a single fused grid.
-__host__ inline bool fmha_split_batch(int B, int nq_pairs, int nheads, int nxcd) {
+// Split B>1 into B=1 launches only when S is long AND one batch already
+// saturates the persist CU cap. Short S (M<8192) always fuses: WGs are
+// short-running and one B*heads launch beats four sequential B=1 launches.
+// Long S with a small grid (B=4 H=8 S=8K = 128 jobs) also stays fused.
+// ZK_FMHA_FUSE_B=1 forces a single fused grid.
+__host__ inline bool fmha_split_batch(int B, int nq_pairs, int nheads, int nxcd, int M) {
     if (B <= 1)
+        return false;
+    if (M < 8192)
         return false;
     if (const char *e = std::getenv("ZK_FMHA_FUSE_B"); e && std::atoi(e) == 1)
         return false;

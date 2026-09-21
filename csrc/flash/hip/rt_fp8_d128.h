@@ -434,6 +434,35 @@ __device__ __forceinline__ void exp2_sc(fx16 &s, float scale, float mnew) {
     }
 }
 
+#if ZK_EXP_SCHRAUDOLPH_FP8
+__device__ __forceinline__ float e4m3_from_code(float code) {
+    return __builtin_amdgcn_cvt_f32_fp8((int)(code + 0.5f), 0);
+}
+
+__device__ __forceinline__ float sum2_local(const fx16 &a, const fx16 &b) {
+    f2 acc = {0.f, 0.f};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const f2 x = {e4m3_from_code(a[2 * i]), e4m3_from_code(a[2 * i + 1])};
+        const f2 y = {e4m3_from_code(b[2 * i]), e4m3_from_code(b[2 * i + 1])};
+        acc += x + y;
+    }
+    return acc[0] + acc[1];
+}
+
+__device__ __forceinline__ float sum_from_pk(const i32x8 &p) {
+    float s = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int w = p[i];
+        s += __builtin_amdgcn_cvt_f32_fp8(w, 0);
+        s += __builtin_amdgcn_cvt_f32_fp8(w, 1);
+        s += __builtin_amdgcn_cvt_f32_fp8(w, 2);
+        s += __builtin_amdgcn_cvt_f32_fp8(w, 3);
+    }
+    return s;
+}
+#else
 __device__ __forceinline__ float sum2_local(const fx16 &a, const fx16 &b) {
     f2 acc = {0.f, 0.f};
 #pragma unroll
@@ -444,6 +473,7 @@ __device__ __forceinline__ float sum2_local(const fx16 &a, const fx16 &b) {
     }
     return acc[0] + acc[1];
 }
+#endif
 
 __device__ __forceinline__ float col_sum4(const s4_tile &s) {
     return xor32_sum(sum2_local(s.a, s.b) + sum2_local(s.c, s.d));
@@ -464,8 +494,17 @@ __device__ __forceinline__ void exp2_s4(s4_tile &s) {
 }
 
 __device__ __forceinline__ int pk_fp8_4(float a, float b, float c, float d) {
+#if ZK_EXP_SCHRAUDOLPH_FP8
+    // a..d are E4M3 codes in [0,126]. Same byte order as cvt_pk_fp8_f32.
+    const int A = (int)(a + 0.5f);
+    const int B = (int)(b + 0.5f);
+    const int C = (int)(c + 0.5f);
+    const int D = (int)(d + 0.5f);
+    return A | (B << 8) | (C << 16) | (D << 24);
+#else
     const int lo = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
     return __builtin_amdgcn_cvt_pk_fp8_f32(c, d, lo, true);
+#endif
 }
 
 __device__ __forceinline__ i32x8 pack_p(const fx16 &lo, const fx16 &hi) {

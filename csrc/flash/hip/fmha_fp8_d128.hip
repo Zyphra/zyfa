@@ -8,6 +8,15 @@
 #ifndef ZK_EXP_SCHRAUDOLPH
 #define ZK_EXP_SCHRAUDOLPH 1
 #endif
+#ifndef ZK_EXP_SCHRAUDOLPH_FP8
+#define ZK_EXP_SCHRAUDOLPH_FP8 0
+#endif
+#ifndef ZK_IGLP_SMX
+#define ZK_IGLP_SMX 2
+#endif
+#ifndef ZK_SETPRIO
+#define ZK_SETPRIO 0  // off: +1% vs s_setprio; 32K 2004 TF
+#endif
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
@@ -81,6 +90,22 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     zk_iglp_smx();
     exp2_sc(s.a, scale, mref);
     exp2_sc(s.b, scale, mref);
+#if ZK_EXP_SCHRAUDOLPH_FP8
+    const i32x8 p_lo = pack_p_consume(s.a, s.b);
+    exp2_sc(s.c, scale, mref);
+    exp2_sc(s.d, scale, mref);
+    l_ = l_ * corr + xor32_sum(sum_from_pk(p_lo) + sum2_local(s.c, s.d));
+#if RESCALE_SKIP
+    if (!__builtin_expect(skip, 1))
+        rescale_o_aiter(o, corr);
+#else
+    rescale_o_aiter(o, corr);
+#endif
+    zk_setprio_hi();
+    mma_pv_lds_preissued(o, vbase, p_lo, 0, vh);
+    zk_setprio_lo();
+    const i32x8 p_hi = pack_p_consume(s.c, s.d);
+#else
     const float sum_ab = sum2_local(s.a, s.b);
     const i32x8 p_lo = pack_p_consume(s.a, s.b);
     // Force exp(c,d) before the first 4 PV so VALU sits under those MFMAs.
@@ -98,6 +123,7 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s4_tile &s, uint32_t vbase
     mma_pv_lds_preissued(o, vbase, p_lo, 0, vh);
     zk_setprio_lo();
     const i32x8 p_hi = pack_p_consume(s.c, s.d);
+#endif
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     wg_bar();
     zk_setprio_hi();
@@ -272,7 +298,7 @@ static void run(const unsigned char *Q, const unsigned char *K, const unsigned c
     const int q_stride = bshd ? Hq * D : D;
     const int kv_stride = bshd ? Hkv * D : D;
     const int bshd_i = bshd ? 1 : 0;
-    const bool split = fmha_split_batch(B, nq_pairs, nheads, nxcd);
+    const bool split = fmha_split_batch(B, nq_pairs, nheads, nxcd, M);
     const int batches = split ? B : 1;
     const int n_head_units = nheads * (split ? 1 : B);
     const int grid = fmha_persist_grid(nq_pairs * n_head_units, nxcd);
