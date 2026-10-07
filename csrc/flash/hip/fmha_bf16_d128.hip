@@ -1,7 +1,8 @@
 #include "hip/hip_runtime.h"
-// Official bf16 D=128: HipKittens attend_ker (KN=64, 8-wave ping-pong).
+// Official bf16 D=128 (and D=64): HipKittens attend_ker (KN=64, 8-wave ping-pong).
 // Native BHSD and BSHD (no host transposes). DeepSeek persist: one WG/CU
 // + inner job walk. Old streamed KN=128 is experimental/fmha_bf16_d128_old.hip.
+// fmha_bf16_d64 lives in this TU (same attend_ker<D>); smem sized by template D.
 #include "cdna4_tiles.cuh"
 #include "xcd_map.h"
 #include <ATen/hip/HIPContext.h>
@@ -377,8 +378,8 @@ __global__ void attend_ker(const attn_globals<D, Bshd> g) {
 
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
-    st_bf<KV_BLOCK_SIZE, ATTN_D, st_32x32_s> (&k_smem)[2] = al.allocate<st_bf<KV_BLOCK_SIZE, ATTN_D, st_32x32_s>, 2>();
-    st_bf<KV_BLOCK_SIZE, ATTN_D, st_8x32_s> (&v_smem)[2] = al.allocate<st_bf<KV_BLOCK_SIZE, ATTN_D, st_8x32_s>, 2>();
+    st_bf<KV_BLOCK_SIZE, D, st_32x32_s> (&k_smem)[2] = al.allocate<st_bf<KV_BLOCK_SIZE, D, st_32x32_s>, 2>();
+    st_bf<KV_BLOCK_SIZE, D, st_8x32_s> (&v_smem)[2] = al.allocate<st_bf<KV_BLOCK_SIZE, D, st_8x32_s>, 2>();
 
     const int H = g.Qg.rows();
     const int H_KV = g.Kg.rows();
@@ -420,10 +421,12 @@ __global__ void attend_ker(const attn_globals<D, Bshd> g) {
     attn_tile<D, bf16, col_l, rt_16x32_4_s> att_block_bf16_in;
     typename attn_tile<D, float, col_l, rt_32x32_s>::row_vec max_vec, norm_vec, max_vec_prev, scale_vec;
 
-    using T = typename st_bf<KV_BLOCK_SIZE, ATTN_D, st_32x32_s>::dtype;
+    using T = typename st_bf<KV_BLOCK_SIZE, D, st_32x32_s>::dtype;
     constexpr int bytes_per_thread = st_32x32_s::template bytes_per_thread<T>();
     constexpr int bytes_per_memcpy = bytes_per_thread * NUM_THREADS;
-    constexpr int memcpy_per_tile = KV_BLOCK_SIZE * ATTN_D * sizeof(T) / bytes_per_memcpy;
+    constexpr int memcpy_per_tile = KV_BLOCK_SIZE * D * sizeof(T) / bytes_per_memcpy;
+    static_assert(KV_BLOCK_SIZE * D * sizeof(T) % bytes_per_memcpy == 0,
+                  "D must divide HK memcpy tile size");
     uint32_t swizzled_offsets_V[memcpy_per_tile];
     uint32_t swizzled_offsets_K[memcpy_per_tile];
     G::prefill_swizzled_offsets<1, false>(k_smem[0], g.Kg, swizzled_offsets_K);
@@ -925,9 +928,14 @@ void dispatch_micro(attn_globals<D, Bshd> g) {
             hipDeviceGetAttribute(&v, hipDeviceAttributeNumberOfXccs, dev) == hipSuccess && v > 0)
             g.nxcd = v;
     }
-    g.pair = 1;
+    // D=64: q-pair is unsafe after other D=64 kernels on the same device
+    // (AITER hd64 leaves the next pair launch producing ±Inf). Single Q
+    // group matches upstream HK d64 and stays correct under the validate order.
+    g.pair = (D >= 128) ? 1 : 0;
     if (const char *e = std::getenv("ZK_FMHA_NO_PAIR"); e && std::atoi(e) == 1)
         g.pair = 0;
+    if (const char *e = std::getenv("ZK_FMHA_FORCE_PAIR"); e && std::atoi(e) == 1)
+        g.pair = 1;
     unsigned long mem_size = g.dynamic_shared_memory();
     hipFuncSetAttribute((void*)attend_ker<D, Bshd>, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
     hipLaunchKernelGGL((attend_ker<D, Bshd>), dim3(g.grid()), dim3(g.block()), mem_size, g.stream, g);
@@ -1008,3 +1016,81 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
 }
 
 } // namespace fmha_bf16_d128
+
+namespace fmha_bf16_d64 {
+
+constexpr float L2E = 1.4426950408889634f;
+
+std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, bool causal,
+                                   bool return_lse, bool bshd) {
+    TORCH_CHECK(causal, "fmha_bf16 is causal-only");
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "fmha_bf16 needs bfloat16");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+                bshd ? "q,k,v must be BSHD [B,S,H,D]" : "q,k,v must be BHSD [B,H,S,D]");
+    q = q.contiguous();
+    k = k.contiguous();
+    v = v.contiguous();
+    const int B = q.size(0), D = q.size(3), Dv = v.size(3);
+    const int Hq = bshd ? q.size(2) : q.size(1);
+    const int M = bshd ? q.size(1) : q.size(2);
+    const int Hkv = bshd ? k.size(2) : k.size(1);
+    const int N = bshd ? k.size(1) : k.size(2);
+    TORCH_CHECK(D == 64 && Dv == 64 && M % 256 == 0 && N % 64 == 0 && N >= 256);
+    TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
+    if (bshd) {
+        TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);
+    } else {
+        TORCH_CHECK(v.size(1) == Hkv && v.size(2) == N);
+    }
+    auto O = bshd ? torch::empty({B, M, Hq, Dv}, q.options().dtype(at::kBFloat16))
+                  : torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kBFloat16));
+    torch::Tensor Lse = torch::empty({B, Hq, 1, M}, q.options().dtype(at::kFloat));
+    const int numQ = (M / Q_BLOCK_SIZE + NUM_WARPS - 1) / NUM_WARPS;
+    // Host-side nq_map must match dispatch_micro: D=64 defaults to no pair.
+    int nq_map = numQ;
+    if (const char *e = std::getenv("ZK_FMHA_FORCE_PAIR"); e && std::atoi(e) == 1)
+        nq_map = (numQ + 1) / 2;
+    // D=64 fused B>1 is incorrect (Inf / large error). Always split B.
+    const bool split = B > 1 || fmha_split_batch(B, nq_map, Hq, fmha_num_xcds(), M);
+    const int batches = split ? B : 1;
+    const int B_launch = split ? 1 : B;
+    const size_t q_batch = (size_t)M * Hq * D;
+    const size_t kv_batch = (size_t)N * Hkv * D;
+    const float sc = (float)scale * L2E;
+    auto launch = [&](auto bshd_tag) {
+        constexpr bool Bshd = decltype(bshd_tag)::value;
+        for (int b = 0; b < batches; ++b) {
+            const uint64_t qoff = (uint64_t)b * q_batch * sizeof(uint16_t);
+            const uint64_t kvoff = (uint64_t)b * kv_batch * sizeof(uint16_t);
+            auto *qp = reinterpret_cast<bf16 *>(reinterpret_cast<uint8_t *>(q.data_ptr()) + qoff);
+            auto *kp = reinterpret_cast<bf16 *>(reinterpret_cast<uint8_t *>(k.data_ptr()) + kvoff);
+            auto *vp = reinterpret_cast<bf16 *>(reinterpret_cast<uint8_t *>(v.data_ptr()) + kvoff);
+            auto *op = reinterpret_cast<bf16 *>(reinterpret_cast<uint8_t *>(O.data_ptr()) + qoff);
+            attn_globals<64, Bshd> g{
+                gl_view<bf16, Bshd>(qp, B_launch, M, Hq, D),
+                gl_view<bf16, Bshd>(kp, B_launch, N, Hkv, D),
+                gl_view<bf16, Bshd>(vp, B_launch, N, Hkv, Dv),
+                gl_view<bf16, Bshd>(op, B_launch, M, Hq, Dv),
+                make_gl<gl<float, -1, -1, -1, -1>>(
+                    reinterpret_cast<uint64_t>(Lse.data_ptr()) + (uint64_t)b * Hq * 1 * M * sizeof(float), B_launch, Hq,
+                    1, M),
+                at::cuda::getCurrentCUDAStream(),
+                8,
+                sc,
+            };
+            dispatch_micro<64, Bshd>(g);
+            const hipError_t err = hipGetLastError();
+            TORCH_CHECK(err == hipSuccess, "fmha_bf16_d64 launch: ", hipGetErrorString(err));
+        }
+    };
+    if (bshd)
+        launch(std::true_type{});
+    else
+        launch(std::false_type{});
+    if (return_lse)
+        return {O, Lse.reshape({B * Hq, M})};
+    return {O};
+}
+
+} // namespace fmha_bf16_d64

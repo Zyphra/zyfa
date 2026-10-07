@@ -78,6 +78,11 @@ __device__ __forceinline__ void zk_qk_group_bf16_d128() {
     sched_vmem_mfma<8, 4, 0>();
 #endif
 }
+__device__ __forceinline__ void zk_qk_group_fp8_d64() {
+#if ZK_QK_GROUP
+    sched_vmem_mfma<2, 2, 0>();
+#endif
+}
 __device__ __forceinline__ void zk_qk_group_fp8_d128() {
 #if ZK_QK_GROUP
     sched_vmem_mfma<4, 2, 0>();
