@@ -216,7 +216,7 @@ __device__ __forceinline__ void add(T &dst, const T &lhs, const U &rhs) {
 #define log  hk_fix::log
 #define add  hk_fix::add
 
-constexpr float RESCALE_THRESHOLD = 8.0f;  // Only rescale if scale factor < 2^-4
+constexpr float RESCALE_THRESHOLD = 8.0f;  // Rescale only when the max rises by more than 8 log2 units
 
 template<typename RV>
 __device__ __forceinline__ int rv_all_below(const RV& prev, const RV& cur, float T) {
@@ -569,7 +569,10 @@ __global__ void attend_ker(const attn_globals<D, Bshd> g) {
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 2:
-        //      A0V0
+        //      Rescale O for the max update in cluster 6, then A0V0
+        if (pending_scale) {
+            mul_col(o_reg, o_reg, scale_vec);
+        }
         __builtin_amdgcn_s_setprio(1);
         mma_AtB(o_reg, subtile_inplace<16>(v_reg, 0), subtile_inplace<16>(att_block_bf16_in, 0), o_reg);
         //      Partial softmax for QK1
@@ -583,7 +586,6 @@ __global__ void attend_ker(const attn_globals<D, Bshd> g) {
         } else {
             sub(scale_vec, max_vec_prev, max_vec);   // diff = prev - new
             exp2(scale_vec, scale_vec);
-            mul_col(o_reg, o_reg, scale_vec);
             copy(max_vec_prev, max_vec);
             pending_scale = 1;
         }
@@ -648,7 +650,10 @@ __global__ void attend_ker(const attn_globals<D, Bshd> g) {
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 6:
-        //      A1V1
+        //      Rescale O for the max update in cluster 2, then A1V1
+        if (pending_scale) {
+            mul_col(o_reg, o_reg, scale_vec);
+        }
         __builtin_amdgcn_s_setprio(1);
         mma_AtB(o_reg, subtile_inplace<16>(v_reg, 0), subtile_inplace<16>(att_block_bf16_in, 0), o_reg);
         //      Partial softmax for QK2
@@ -662,7 +667,6 @@ __global__ void attend_ker(const attn_globals<D, Bshd> g) {
         } else {
             sub(scale_vec, max_vec_prev, max_vec);   // diff = prev - new
             exp2(scale_vec, scale_vec);
-            mul_col(o_reg, o_reg, scale_vec);
             copy(max_vec_prev, max_vec);
             pending_scale = 1;
         }
@@ -699,7 +703,9 @@ __global__ void attend_ker(const attn_globals<D, Bshd> g) {
     mma_ABt(att_block[1], k_reg, q_reg, att_block[1]);
     //      Finish softmax for QK2
     exp2(att_block[0].tiles[1][0], att_block[0].tiles[1][0]);
-    mul(norm_vec, norm_vec, scale_vec);
+    if (pending_scale) {
+        mul(norm_vec, norm_vec, scale_vec);
+    }
 
     col_sum(norm_vec, att_block[0], norm_vec);
     copy(att_block_bf16, att_block[0]);
@@ -728,7 +734,10 @@ __global__ void attend_ker(const attn_globals<D, Bshd> g) {
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 2:
-    //      A2V2
+    //      Rescale O for the last hot loop max update, then A2V2
+    if (pending_scale) {
+        mul_col(o_reg, o_reg, scale_vec);
+    }
     __builtin_amdgcn_s_setprio(1);
     mma_AtB(o_reg, v_reg, att_block_bf16_in, o_reg);
     //      Partial softmax for QK3
@@ -961,6 +970,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     const int Hkv = bshd ? k.size(2) : k.size(1);
     const int N = bshd ? k.size(1) : k.size(2);
     TORCH_CHECK(D == 128 && Dv == 128 && M % 256 == 0 && N % 64 == 0 && N >= 256);
+    TORCH_CHECK(M == N, "fmha_bf16 needs equal query and key lengths, got M=", M, " N=", N);
     TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
     if (bshd) {
         TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);
@@ -1037,6 +1047,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     const int Hkv = bshd ? k.size(2) : k.size(1);
     const int N = bshd ? k.size(1) : k.size(2);
     TORCH_CHECK(D == 64 && Dv == 64 && M % 256 == 0 && N % 64 == 0 && N >= 256);
+    TORCH_CHECK(M == N, "fmha_bf16 needs equal query and key lengths, got M=", M, " N=", N);
     TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
     if (bshd) {
         TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);
