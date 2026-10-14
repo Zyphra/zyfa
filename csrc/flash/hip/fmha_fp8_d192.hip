@@ -287,6 +287,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     const int N = bshd ? k.size(1) : k.size(2);
     const int B = q.size(0);
     TORCH_CHECK(D == 192 && Dv == 128 && M % 256 == 0 && N % 64 == 0);
+    TORCH_CHECK(M == N && scale > 0, "fmha_fp8_d192 needs M == N and scale > 0");
     TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
     if (bshd) {
         TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);

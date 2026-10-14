@@ -1,6 +1,6 @@
 // HK GQA causal + XCD pair, fp8 fat 32x32x64, KN=128, streamed LDS K/V.
 // KV loop unrolled 8. QK stays at lgkmcnt(2); next-K under last PV aliases k_frag.
-// One bar per tile (after softmax, before last PV). D=Dv=128 / 8-wave / causal only.
+// Two bars per tile (start, and before last PV). D=Dv=128 / 8-wave / causal only.
 // RESCALE_SKIP: true (default) = HK Δmax≤8 delayed update. false = always rescale.
 #ifndef RESCALE_SKIP
 #define RESCALE_SKIP true
@@ -225,12 +225,9 @@ __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const unsigne
         pin_kf(kf);
 
         auto one_tile = [&](int kb) {
-            if constexpr (PairHeads) {
-                // Two 4-wave groups share K/V. Drain this wave's G2S before
-                // the other group reads the ping-pong slot.
-                asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-                wg_bar();
-            }
+            // Other waves may still read s.v[nx] in the previous tile's last PV.
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            wg_bar();
             const int cur = kb & 1, nx = cur ^ 1;
             const uint32_t kbase = lds_u32(s.k[cur].data);
             const uint32_t vbase = lds_u32(s.v[cur].data);
@@ -340,6 +337,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     const int Hkv = bshd ? k.size(2) : k.size(1);
     const int N = bshd ? k.size(1) : k.size(2);
     TORCH_CHECK(D == 128 && Dv == 128 && M % 256 == 0 && N % 128 == 0);
+    TORCH_CHECK(M == N && scale > 0, "fmha_fp8 needs M == N and scale > 0");
     TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
     if (bshd) {
         TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);
