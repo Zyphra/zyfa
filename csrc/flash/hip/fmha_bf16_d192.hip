@@ -23,7 +23,12 @@ constexpr int NT = 512;
 constexpr float L2E = 1.4426950408889634f;
 constexpr float LN2 = 0.6931471805599453f;
 
-__device__ __forceinline__ __attribute__((convergent)) void wg_bar() { __syncthreads(); }
+// buffer_load ... lds completes asynchronously and is counted by vmcnt. Wait for this wave's
+// K/V loads before the barrier so every wave reads complete tiles after it.
+__device__ __forceinline__ __attribute__((convergent)) void wg_bar() {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __syncthreads();
+}
 
 struct alignas(16) Smem {
     st_k k[2];
@@ -164,7 +169,8 @@ __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const bf16 *Q
         pin_o(oR);
         float m_ = neg_inf(), l_ = 0.f;
 
-        if (pp)
+        // Other waves may still read the previous pass or job's last tile.
+        if (pp || job != (int)blockIdx.x)
             wg_bar();
         prefetch_k(s.k[0], kv_tile_ptr(Kh, 0, k_stride), k_stride);
         prefetch_v(s.v[0], kv_tile_ptr(Vh, 0, v_stride), v_stride);
@@ -289,6 +295,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     const int Hkv = bshd ? k.size(2) : k.size(1);
     const int N = bshd ? k.size(1) : k.size(2);
     TORCH_CHECK(D == 192 && Dv == 128 && M % 256 == 0 && N % 64 == 0);
+    TORCH_CHECK(M == N, "fmha_bf16_d192 needs equal query and key lengths, got M=", M, " N=", N);
     TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
     if (bshd) {
         TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);
