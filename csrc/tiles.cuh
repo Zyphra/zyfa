@@ -1,6 +1,6 @@
 #pragma once
-// Slim CDNA4 tile include for official bf16 d128 attend_ker.
-// CDNA4 only. No cdna3, cdna5, pyutils, warp-shared, or group-vec.
+// The subset of HipKittens (CDNA4) used by bf16_d128.hip, plus an N-warp group with the global-to-shared loads.
+// Adapted from HipKittens (MIT License, Copyright (c) 2024 HazyResearch; see third_party/hipkittens/LICENSE).
 #ifndef KITTENS_CDNA4
 #define KITTENS_CDNA4
 #endif

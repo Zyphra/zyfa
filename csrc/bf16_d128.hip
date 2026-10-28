@@ -1,41 +1,19 @@
+// BF16 causal forward attention, d = 128: HipKittens' 8-wave ping-pong kernel with 64-key tiles, a
+// persistent grid, causal Q-block pairing and native BHSD / BSHD layouts.
+//
+// Adapted from HipKittens kernels/cdna4/attn/gqa_causal/kernel.cpp (https://github.com/HazyResearch/HipKittens).
+// MIT License, Copyright (c) 2024 HazyResearch; see third_party/hipkittens/LICENSE.
 #include "hip/hip_runtime.h"
-// Official bf16 D=128 (and D=64): HipKittens attend_ker (KN=64, 8-wave ping-pong).
-// Native BHSD and BSHD (no host transposes). DeepSeek persist: one WG/CU
-// + inner job walk. Old streamed KN=128 is experimental/fmha_bf16_d128_old.hip.
-// fmha_bf16_d64 lives in this TU (same attend_ker<D>); smem sized by template D.
-#include "cdna4_tiles.cuh"
+#include "tiles.cuh"
 #include "xcd_map.h"
 #include <ATen/hip/HIPContext.h>
 #include <torch/extension.h>
+#include <c10/hip/HIPGuard.h>
 #include <cstdint>
-#include <cstdlib>
 #include <type_traits>
 
-#ifndef ATTN_B
-constexpr int ATTN_B = 16; // batch size
-#endif
-
-#ifndef ATTN_H
-constexpr int ATTN_H = 64; // number of heads
-#endif
-
-#ifndef ATTN_H_KV
-constexpr int ATTN_H_KV = 8; // number of heads for key and value
-#endif
-
-constexpr int GROUP_SIZE = ATTN_H / ATTN_H_KV; // queries per KV head group
-
-#ifndef ATTN_N
-constexpr int ATTN_N = 8192; // sequence length
-#endif
-
-#ifndef ATTN_D
-constexpr int ATTN_D = 128; // dimension
-#endif
-
-constexpr int Q_BLOCK_SIZE = 32; // q block size
-constexpr int KV_BLOCK_SIZE = 64; // kv block size
-constexpr bool causal = true;
+constexpr int Q_BLOCK_SIZE = 32;
+constexpr int KV_BLOCK_SIZE = 64;
 
 #define NUM_WARPS 8
 #define NUM_THREADS (kittens::WARP_THREADS * NUM_WARPS)
@@ -46,8 +24,7 @@ constexpr bool causal = true;
 
 using namespace kittens;
 
-// Logical coords stay {b, s, h, c}. Physical packing is BHSD or BSHD.
-// stride<1>() is the seq-axis pitch the tile loads use (axis=1).
+// Logical coords stay {b, s, h, c}; the physical packing is BHSD or BSHD. stride<1>() is the sequence pitch.
 template<typename T, bool Bshd>
 struct gl_view {
     using identifier = ducks::gl::identifier;
@@ -94,10 +71,8 @@ struct gl_view {
     }
 };
 
-// HipKittens load/store set the raw-buffer range to uint32(B*S*H*D*elem). That
-// wraps to 0 at 4 GiB (B=4 S=128K H=32 bf16) and Q/O become zeros. The pointer
-// is already tile-local; this view keeps stride/index honest and makes the
-// uint32 product a large in-range value (signed-safe intermediates).
+// HipKittens sizes buffer resources as uint32(B*S*H*D*elem), which wraps at 4 GiB. The tile pointer is already
+// tile-local, so this view reports a large in-range size instead.
 template<typename GL>
 struct gl_u32_range {
     using identifier = ducks::gl::identifier;
@@ -115,25 +90,26 @@ struct gl_u32_range {
 template<typename GL>
 __device__ __forceinline__ gl_u32_range<GL> sat_gl(const GL &g) { return {g}; }
 
+// Buffer range in bytes; 0 or anything past 4 GiB becomes the maximum.
 __device__ __forceinline__ uint32_t sat_u32_bytes(uint64_t n) {
     return (n == 0ull || n > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)n;
 }
 
 using G = kittens::group<NUM_WARPS>;
 
-#define SCHED_BARRIER(mask, cnt, group) __builtin_amdgcn_sched_group_barrier(mask, cnt, group)
-
+// Pairs x (one MFMA, then VALU_CNT VALU instructions).
 template<int Pairs, int VALU_CNT, int Group>
 __device__ __forceinline__ void sched_barrier_pairs() {
-    SCHED_BARRIER(MFMA_MASK, 1, Group);
-    SCHED_BARRIER(VALU_MASK, VALU_CNT, Group);
+    __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, Group);
+    __builtin_amdgcn_sched_group_barrier(VALU_MASK, VALU_CNT, Group);
     if constexpr (Pairs > 1) sched_barrier_pairs<Pairs - 1, VALU_CNT, Group>();
 }
 
+// Pairs x (one MFMA, then EXP_CNT transcendental instructions).
 template<int Pairs, int EXP_CNT, int Group>
 __device__ __forceinline__ void sched_barrier_exp_pairs() {
-    SCHED_BARRIER(MFMA_MASK, 1, Group);
-    SCHED_BARRIER(EXP_MASK, EXP_CNT, Group);
+    __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, Group);
+    __builtin_amdgcn_sched_group_barrier(EXP_MASK, EXP_CNT, Group);
     if constexpr (Pairs > 1) sched_barrier_exp_pairs<Pairs - 1, EXP_CNT, Group>();
 }
 
@@ -148,8 +124,8 @@ __device__ inline void exp2_rt_base(rt_base<T, layout, shape> &dst, const rt_bas
 
 }
 
-// ROCm 7.2 / clang 22: kittens::{zero,ones,copy,sub,mul,exp2} are ambiguous
-// across tile/vec/art maps. Concepts work in static_assert; overloads do not.
+// kittens::{zero, ones, copy, sub, mul, exp2, log, add} are ambiguous between the tile and vector overloads on
+// ROCm 7.2's clang; these dispatch explicitly.
 namespace hk_fix {
 template<typename T>
 __device__ __forceinline__ void zero(T &dst) {
@@ -216,32 +192,74 @@ __device__ __forceinline__ void add(T &dst, const T &lhs, const U &rhs) {
 #define log  hk_fix::log
 #define add  hk_fix::add
 
-constexpr float RESCALE_THRESHOLD = 8.0f;  // Rescale only when the max rises by more than 8 log2 units
-
+// The scale is applied to the fp32 scores, x = fma(s, c, -m), not folded into Q. c = scale * log2 e > 0, so
+// max(c * s) = c * max(s) and masked -inf scores stay -inf.
 template<typename RV>
-__device__ __forceinline__ int rv_all_below(const RV& prev, const RV& cur, float T) {
+__device__ __forceinline__ int rv_all_below_fma(const RV &prev, const RV &raw, float c, float T) {
     int ok = 1;
     #pragma unroll
     for (int o = 0; o < RV::outer_dim; ++o) {
-        for (int i = 0; i < RV::inner_dim; ++i) {
-            ok &= (float(cur.data[o][i]) - float(prev.data[o][i]) <= T);
+        #pragma unroll
+        for (int i = 0; i < RV::inner_dim; ++i)
+            ok &= (__builtin_fmaf(float(raw.data[o][i]), c, -float(prev.data[o][i])) <= T);
+    }
+    return ok;
+}
+template<typename RV>
+__device__ __forceinline__ void rv_scale_merge(RV &cur, const RV &prev, float c) {   // cur: raw max in, running max out
+    #pragma unroll
+    for (int o = 0; o < RV::outer_dim; ++o) {
+        #pragma unroll
+        for (int i = 0; i < RV::inner_dim; ++i)
+            cur.data[o][i] = fmaxf(float(prev.data[o][i]), c * float(cur.data[o][i]));
+    }
+}
+template<typename RV>
+__device__ __forceinline__ void rv_scale(RV &v, float c) {
+    #pragma unroll
+    for (int o = 0; o < RV::outer_dim; ++o) {
+        #pragma unroll
+        for (int i = 0; i < RV::inner_dim; ++i)
+            v.data[o][i] = c * float(v.data[o][i]);
+    }
+}
+// x = s*c - m per score, one scalar FMA each (pinned: a paired v_pk_fma_f32 cannot issue while an MFMA runs).
+template<typename T, typename V>
+__device__ __forceinline__ void sub_col_fma(T &dst, const T &src, float c, const V &col_values) {
+    #pragma unroll
+    for (int j = 0; j < dst.width; j++) {
+        const float m = col_values[j][0];
+        #pragma unroll
+        for (int i = 0; i < dst.height; i++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_base_tile; k++) {
+                float x = __builtin_fmaf(src.tiles[i][j].data[k].x, c, -m);
+                float y = __builtin_fmaf(src.tiles[i][j].data[k].y, c, -m);
+                asm volatile("" : "+v"(x), "+v"(y));
+                dst.tiles[i][j].data[k].x = x;
+                dst.tiles[i][j].data[k].y = y;
+            }
         }
     }
-    return ok;  // 1 or 0, per lane
 }
-// Wave-uniform: true iff EVERY lane says "all below"
+// Lazy rescale: O and l are rescaled only when some row's max grows by more than this (log2 units, wave vote).
+constexpr float RESCALE_THRESHOLD = 0.5f;
+
+// True iff every lane votes "all below".
 __device__ __forceinline__ int wave_all_ok(int lane_ok) {
-    return __all(lane_ok);  // 1 fast vote; no ds_bpermute ladder
+    return __all(lane_ok);
 }
 
-template<int D, typename T=bf16, typename L=row_l, typename S=rt_32x16_s> using qo_tile = rt<T, Q_BLOCK_SIZE, D, L, S>;
-template<int D, typename T=bf16, typename L=col_l, typename S=rt_16x32_s> using qo_tile_transposed = rt<T, D, Q_BLOCK_SIZE, L, S>;
-template<int D, typename T=bf16, typename L=row_l, typename S=rt_32x16_s> using kv_tile = rt<T, KV_BLOCK_SIZE, D, L, S>;
-template<int D, typename T=float, typename L=col_l, typename S=rt_16x32_4_s> using attn_tile = rt<T, KV_BLOCK_SIZE, Q_BLOCK_SIZE, L, S>;
+template<int D, typename T=bf16, typename L=row_l, typename S=rt_32x16_s>
+using qo_tile = rt<T, Q_BLOCK_SIZE, D, L, S>;
+template<int D, typename T=bf16, typename L=col_l, typename S=rt_16x32_s>
+using qo_tile_transposed = rt<T, D, Q_BLOCK_SIZE, L, S>;
+template<int D, typename T=bf16, typename L=row_l, typename S=rt_32x16_s>
+using kv_tile = rt<T, KV_BLOCK_SIZE, D, L, S>;
+template<int D, typename T=float, typename L=col_l, typename S=rt_16x32_4_s>
+using attn_tile = rt<T, KV_BLOCK_SIZE, Q_BLOCK_SIZE, L, S>;
 
-// LDS→reg with every packed element consumed after waitcnt so LLVM cannot
-// sink a ds_read past the next smem ping-pong fill. Stock used transpose()
-// as that consume; ABt has no such use.
+// LDS -> registers, every element pinned after the wait so LLVM cannot sink a read past the next LDS fill.
 template<ducks::rt::all RT, ducks::st::all ST>
 __device__ __forceinline__ void load_pinned(RT &dst, const ST &src) {
     load(dst, src);
@@ -255,17 +273,13 @@ __device__ __forceinline__ void load_pinned(RT &dst, const ST &src) {
                 asm volatile("" : "+v"(dst.tiles[i][j].data[p]) :: "memory");
 }
 
-/**********************************************************/
+// x = -inf if rel < THR_X, y = -inf if rel < THR_Y.
 template<int THR_X, int THR_Y>
 __device__ inline void mask_vec2_imm(uint32_t rel_vgpr, uint32_t neg_inf_vgpr,
                                      uint32_t& x_ref, uint32_t& y_ref) {
-
     uint64_t x_mask, y_mask;
-    // uint32_t ox, oy;
     asm volatile(
-        // x: rel < THR_X ?
         "v_cmp_lt_i32_e64 %0, %6, %7\n\t"
-        // y: rel < THR_Y ?
         "v_cmp_lt_i32_e64 %1, %6, %9\n\t"
         "v_cndmask_b32_e64 %2, %4, %8, %0\n\t"
         "v_cndmask_b32_e64 %3, %5, %8, %1\n\t"
@@ -274,27 +288,20 @@ __device__ inline void mask_vec2_imm(uint32_t rel_vgpr, uint32_t neg_inf_vgpr,
           "n"(THR_X), "v"(neg_inf_vgpr), "n"(THR_Y)
         : "vcc"
     );
-    // x_ref = ox; y_ref = oy;
 }
 
+// Causal mask of an S^T tile: key k is masked for query q when k > q.
 template<ducks::rt::col_layout RT>
 __device__ inline void mask_kv_tile(RT &dst, int q_abs, int k_abs, uint32_t neg_inf_v, int lane) {
-    const int col  = lane & 31;                 // 0..31 column within the 32-wide col tile
-
-    // Absolute positions
-    const int q_base = q_abs * Q_BLOCK_SIZE;    // start index for this Q tile
-    const int k_base = k_abs * KV_BLOCK_SIZE;   // start index for this K/V tile
-
-    // q position for this lane's column
+    const int col  = lane & 31;
+    const int q_base = q_abs * Q_BLOCK_SIZE;
+    const int k_base = k_abs * KV_BLOCK_SIZE;
     const int q_pos  = q_base + col;
 
     #pragma unroll
     for (int i = 0; i < dst.height; ++i) {
-        // Row base of the 32x* chunk produced by MFMA 
-        const int row_base = (i * 32) + ((lane >> 5) << 2); // multiplesof 4
-
-        // Relative index of the FIRST element in this row-chunk w.r.t. q_pos
-        // (smaller rel ⇒ more "future" keys that must be -inf)
+        // First key row of this lane's elements in the 32-row MFMA chunk.
+        const int row_base = (i * 32) + ((lane >> 5) << 2);
         const int rel0 = q_pos - (k_base + row_base);
         const uint32_t rel = static_cast<uint32_t>(rel0);
 
@@ -317,9 +324,6 @@ __device__ inline void mask_kv_tile(RT &dst, int q_abs, int k_abs, uint32_t neg_
             auto& d7x = *reinterpret_cast<uint32_t*>(&dst.tiles[i][j].data[7].x);
             auto& d7y = *reinterpret_cast<uint32_t*>(&dst.tiles[i][j].data[7].y);
 
-            //  - reuse a single neg_inf register
-            //  - keep VCC live across the pair
-            //  - avoid reloading -inf or recomputing rel
             mask_vec2_imm< 0, 1 >(rel, neg_inf_v, d0x, d0y);
             mask_vec2_imm< 2, 3 >(rel, neg_inf_v, d1x, d1y);
             mask_vec2_imm< 8, 9 >(rel, neg_inf_v, d2x, d2y);
@@ -332,46 +336,139 @@ __device__ inline void mask_kv_tile(RT &dst, int q_abs, int k_abs, uint32_t neg_
     }
 }
 
-/**********************************************************/
-
-__device__ __forceinline__ void hk_xcd_map(int nq_pairs, int BH, int nxcd, int &qx, int &bh, int i) {
-    if (nxcd <= 1) {
-        qx = i % nq_pairs;
-        bh = i / nq_pairs;
-        return;
-    }
-    const int total = nq_pairs * BH;
-    const int n_per = total / nxcd;
-    const int extra = total % nxcd;
-    const int xcd = i % nxcd;
-    const int seq = i / nxcd;
-    const int off = xcd * n_per + (xcd < extra ? xcd : extra);
-    const int L = off + seq;
-    qx = L % nq_pairs;
-    bh = L / nq_pairs;
-}
-
 template<int D, bool Bshd> struct attn_globals {
     gl_view<bf16, Bshd> Qg, Kg, Vg, Og;
     gl<float, -1, -1, -1, -1> L_vec;
     hipStream_t stream;
     int nxcd;
     float scale;
-    int pair; // 1 = q_lo/q_hi causal pair. 0 = one Q group / job (upstream HK).
+    int pair; // 1: a job is a causal Q-block pair (q_lo, q_hi). 0: one Q block per job.
     dim3 grid() {
         const int Nseq = Qg.depth(), H = Qg.rows(), B = Qg.batch();
         const int numQ = (Nseq / Q_BLOCK_SIZE + NUM_WARPS - 1) / NUM_WARPS;
         const int nq_map = pair ? (numQ + 1) / 2 : numQ;
         const int n_work = nq_map * H * B;
-        // DeepSeek persist: one WG per CU, inner job walk in attend_ker.
-        int grid = fmha_persist_grid(n_work, nxcd);
-        if (const char *e = std::getenv("ZK_FMHA_NO_PERSIST"); e && std::atoi(e) == 1)
-            grid = n_work;
-        return dim3(grid);
+        // Persistent grid: at most one workgroup per CU, each walking jobs.
+        return dim3(fmha_persist_grid(n_work, nxcd));
     }
     dim3 block() { return dim3(NUM_THREADS); }
     size_t dynamic_shared_memory() { return MAX_SHARED_MEMORY; }
 };
+
+// Lane id from an asm v_mbcnt, so the epilogue's lane addresses are not hoisted out of the main loop.
+__device__ __forceinline__ int lane_novec() {
+    int l;
+    asm volatile("v_mbcnt_lo_u32_b32 %0, -1, 0\n\tv_mbcnt_hi_u32_b32 %0, -1, %0" : "=v"(l));
+    return l;
+}
+
+// Q tile load with HipKittens' load<1, qo_tile> lane mapping, through a wave-uniform buffer resource and with all
+// chunks in flight at once; issued before the first K wait so the two latencies overlap.
+template<int D>
+struct q_raw {
+    float4 c[D / 16];
+};
+template<int D, typename GL>
+__device__ __forceinline__ void qload_issue(q_raw<D> &raw, const GL &gq, int b, int tile, int h) {
+    using RT = rt<float, Q_BLOCK_SIZE, D, row_l, rt_32x16_s>;
+    static_assert(RT::height == 1 && RT::width == D / 16 && RT::base_tile_rows == 32 && RT::base_tile_stride == 8 &&
+                  RT::base_tile_num_strides == 1 && RT::base_tile_cols == 16, "q_raw assumes HK's 32x16 row tiles");
+    const bf16 *p = &gq[(coord<RT>{b, tile, h, 0}.template unit_coord<1, 3>())];
+    const uint64_t a = reinterpret_cast<uint64_t>(p);
+    i32x4 rs;
+    rs[0] = __builtin_amdgcn_readfirstlane((int)(uint32_t)a);
+    rs[1] = __builtin_amdgcn_readfirstlane((int)(uint32_t)(a >> 32));
+    rs[2] = 0x7FFFFFFE;                 // gl_u32_range: cols() * sizeof(bf16)
+    rs[3] = 0x00020000;
+    const int lane = lane_novec();
+    const uint32_t voff =
+        (uint32_t)(((lane % 32) * (int)gq.template stride<1>() + 8 * (lane / 32)) * (int)sizeof(bf16));
+    #pragma unroll
+    for (int j = 0; j < D / 16; ++j)
+        raw.c[j] = std::bit_cast<float4>(llvm_amdgcn_raw_buffer_load_b128(rs, voff + 32u * j, 0, 0));
+}
+template<int D>
+__device__ __forceinline__ void qload_finish(rt<bf16, Q_BLOCK_SIZE, D, row_l, rt_32x16_s> &q, const q_raw<D> &raw) {
+    #pragma unroll
+    for (int j = 0; j < D / 16; ++j) {
+        const bf16_2 *t = reinterpret_cast<const bf16_2 *>(&raw.c[j]);
+        #pragma unroll
+        for (int l = 0; l < 4; ++l)
+            q.tiles[0][j].data[l] = t[l];
+    }
+}
+
+// O epilogue (D = 128) through LDS: each wave writes its bf16 O block (32 rows x 256 B) to its own 8 KB (16 B slot
+// XOR row & 15, 8 B half XOR row bit 4), then stores it row-contiguously, 16 B per lane and 4 rows per instruction.
+// The store of a pass is deferred to the next pass's prologue, after its loads.
+template<typename RT>
+__device__ inline void stage_o_write(const RT &src, uint32_t stage) {
+    static_assert(RT::rows == 32 && RT::cols == 128 && RT::base_tile_rows == 32 && RT::base_tile_stride == 4,
+                  "D=128 only");
+    const int lane = lane_novec();
+    const int row = lane & 31, half = lane >> 5;
+    // element (row, col) at row*256 + 16*((col>>3) ^ (row&15)) + 8*(((col>>2)&1) ^ ((row>>4)&1))
+    const uint32_t wrow = stage + row * 256, wx = row & 15, wh = (half ^ ((row >> 4) & 1)) * 8;
+#pragma unroll
+    for (int j = 0; j < RT::width; j++) {
+        uint64_t d[4];
+        uint32_t a[4];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            bf16_2 tmp[2];
+            tmp[0] = base_types::convertor<bf16_2, float2>::convert(src.tiles[0][j].data[2 * k]);
+            tmp[1] = base_types::convertor<bf16_2, float2>::convert(src.tiles[0][j].data[2 * k + 1]);
+            d[k] = *reinterpret_cast<uint64_t *>(tmp);
+            a[k] = wrow + (((4 * j + k) ^ wx) * 16) + wh;
+        }
+        asm volatile("ds_write_b64 %0, %4\n\tds_write_b64 %1, %5\n\tds_write_b64 %2, %6\n\tds_write_b64 %3, %7"
+                     :: "v"(a[0]), "v"(a[1]), "v"(a[2]), "v"(a[3]), "v"(d[0]), "v"(d[1]), "v"(d[2]), "v"(d[3])
+                     : "memory");
+    }
+}
+
+// Reads the staged block back and stores it (row-contiguous 16 B per lane, 4 rows per instruction).
+template<typename RT, typename GL, typename COORD>
+__device__ inline void stage_o_flush(const GL &dst, const COORD &idx, uint32_t stage) {
+    using U = bf16;
+    U *dst_ptr = (U *)&dst[(idx.template unit_coord<1, 3>())];
+    const int row_stride = dst.template stride<1>();
+    const int lane = lane_novec();
+    // Chunk c = rows 4c..4c+3; lane (rq = lane>>4, s = lane&15) reads row 4c+rq, LDS slot s ^ ((4c+rq)&15).
+    const int s = lane & 15, rq = lane >> 4;
+    const uint32_t Br = stage + rq * 256, sx = s ^ rq;      // XOR the slot index only (stage need not be 256-aligned)
+    const uint32_t B = Br + sx * 16, B1 = Br + (sx ^ 4) * 16, B2 = Br + (sx ^ 8) * 16, B3 = Br + (sx ^ 12) * 16;
+    __uint128_t rd0, rd1, rd2, rd3, rd4, rd5, rd6, rd7;
+    asm volatile("s_waitcnt lgkmcnt(0)\n\t"
+                 "ds_read_b128 %0, %8\n\tds_read_b128 %1, %9 offset:1024\n\t"
+                 "ds_read_b128 %2, %10 offset:2048\n\tds_read_b128 %3, %11 offset:3072\n\t"
+                 "ds_read_b128 %4, %8 offset:4096\n\tds_read_b128 %5, %9 offset:5120\n\t"
+                 "ds_read_b128 %6, %10 offset:6144\n\tds_read_b128 %7, %11 offset:7168\n\t"
+                 "s_waitcnt lgkmcnt(0)"
+                 : "=&v"(rd0), "=&v"(rd1), "=&v"(rd2), "=&v"(rd3), "=&v"(rd4), "=&v"(rd5), "=&v"(rd6), "=&v"(rd7)
+                 : "v"(B), "v"(B1), "v"(B2), "v"(B3) : "memory");
+    __uint128_t rd[8] = {rd0, rd1, rd2, rd3, rd4, rd5, rd6, rd7};
+    const uint32_t buffer_size = dst.batch() * dst.depth() * dst.rows() * dst.cols() * sizeof(U);
+    const buffer_resource br = make_buffer_resource(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(dst_ptr)),
+                                                    buffer_size, 0x00020000);
+    i32x4 rs = std::bit_cast<i32x4>(br);
+    // The O tile pointer is wave-uniform: say so, or every store sits in a readfirstlane loop.
+    #pragma unroll
+    for (int w = 0; w < 4; ++w)
+        rs[w] = __builtin_amdgcn_readfirstlane(rs[w]);
+#pragma unroll
+    for (int c = 0; c < 8; c++) {
+        const int r = 4 * c + rq;
+        __uint128_t v = rd[c];
+        if (c >= 4) {   // rows 16-31 keep their 8 B halves swapped in LDS
+            uint64_t *h = reinterpret_cast<uint64_t *>(&v);
+            const uint64_t t0 = h[0];
+            h[0] = h[1];
+            h[1] = t0;
+        }
+        llvm_amdgcn_raw_buffer_store_b128(v, rs, (r * row_stride + 8 * s) * sizeof(U), 0, 0);
+    }
+}
 
 template<int D, bool Bshd> __launch_bounds__(NUM_THREADS, 2)
 __global__ void attend_ker(const attn_globals<D, Bshd> g) {
@@ -380,6 +477,9 @@ __global__ void attend_ker(const attn_globals<D, Bshd> g) {
     shared_allocator al((int*)&__shm[0]);
     st_bf<KV_BLOCK_SIZE, D, st_32x32_s> (&k_smem)[2] = al.allocate<st_bf<KV_BLOCK_SIZE, D, st_32x32_s>, 2>();
     st_bf<KV_BLOCK_SIZE, D, st_8x32_s> (&v_smem)[2] = al.allocate<st_bf<KV_BLOCK_SIZE, D, st_8x32_s>, 2>();
+    st_bf<Q_BLOCK_SIZE, D, st_32x32_s> (&o_stage)[NUM_WARPS] =
+        al.allocate<st_bf<Q_BLOCK_SIZE, D, st_32x32_s>, NUM_WARPS>();
+    static_assert(D != 128 || sizeof(st_bf<Q_BLOCK_SIZE, D, st_32x32_s>) == 8192, "8 KB per wave");
 
     const int H = g.Qg.rows();
     const int H_KV = g.Kg.rows();
@@ -427,526 +527,533 @@ __global__ void attend_ker(const attn_globals<D, Bshd> g) {
     constexpr int memcpy_per_tile = KV_BLOCK_SIZE * D * sizeof(T) / bytes_per_memcpy;
     static_assert(KV_BLOCK_SIZE * D * sizeof(T) % bytes_per_memcpy == 0,
                   "D must divide HK memcpy tile size");
+    // The vmcnt waits below count G::load issues: memcpy_per_tile per K or V tile (2 at D = 128, 1 at D = 64).
     uint32_t swizzled_offsets_V[memcpy_per_tile];
     uint32_t swizzled_offsets_K[memcpy_per_tile];
     G::prefill_swizzled_offsets<1, false>(k_smem[0], g.Kg, swizzled_offsets_K);
     G::prefill_swizzled_offsets<1, false>(v_smem[0], g.Vg, swizzled_offsets_V);
 
-    // DeepSeek persist: one WG/CU, inner job walk after the prologue.
+    // Deferred O / LSE stores of the previous pass (D = 128).
+    int ost_pend = 0, ost_b = 0, ost_t = 0, ost_h = 0;
+    typename attn_tile<D, float, col_l, rt_32x32_s>::row_vec ost_lse;
+    const uint32_t ost_stage =
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&o_stage[0].data[0])) + 8192u * warpid();
+    // Persistent grid: each workgroup walks jobs after the prologue.
     for (int job = (int)blockIdx.x; job < n_jobs; job += stride) {
-    if (job != (int)blockIdx.x) {
-        asm volatile("s_waitcnt vmcnt(0)");
-        __builtin_amdgcn_s_barrier();
-    }
-    int qx, bh;
-    hk_xcd_map(nq_map, B * H, g.nxcd, qx, bh, job);
-    const int batch_idx = bh / H;
-    const int head_idx = bh % H;
-    const int head_idx_kv = head_idx / GROUP;
-    const bf16* k_base = (bf16*)&g.Kg[{batch_idx, 0, head_idx_kv, 0}];
-    const bf16* v_base = (bf16*)&g.Vg[{batch_idx, 0, head_idx_kv, 0}];
-    i32x4 k_srsrc_base = make_srsrc(k_base, sat_u32_bytes((uint64_t)(uint32_t)k_row_stride * (uint64_t)(uint32_t)Nseq), k_row_stride);
-    i32x4 v_srsrc_base = make_srsrc(v_base, sat_u32_bytes((uint64_t)(uint32_t)v_row_stride * (uint64_t)(uint32_t)Nseq), v_row_stride);
+        if (job != (int)blockIdx.x) {
+            asm volatile("s_waitcnt vmcnt(0)");
+            __builtin_amdgcn_s_barrier();
+        }
+        int qx, bh;
+        fmha_xcd_map(nq_map, B * H, g.nxcd, qx, bh, job);
+        const int batch_idx = bh / H;
+        const int head_idx = bh % H;
+        const int head_idx_kv = head_idx / GROUP;
+        const bf16* k_base = (bf16*)&g.Kg[{batch_idx, 0, head_idx_kv, 0}];
+        const bf16* v_base = (bf16*)&g.Vg[{batch_idx, 0, head_idx_kv, 0}];
+        i32x4 k_srsrc_base = make_srsrc(
+            k_base, sat_u32_bytes((uint64_t)(uint32_t)k_row_stride * (uint64_t)(uint32_t)Nseq), k_row_stride);
+        i32x4 v_srsrc_base = make_srsrc(
+            v_base, sat_u32_bytes((uint64_t)(uint32_t)v_row_stride * (uint64_t)(uint32_t)Nseq), v_row_stride);
 
-    const int q_lo = qx, q_hi = g.pair ? (numQ - 1 - qx) : qx;
-    for (int pp = 0; pp < 2; ++pp) {
-        const int qblk = pp ? q_lo : q_hi;
-        if (pp && q_lo == q_hi)
-            break;
-        const int tile_idx = qblk * NUM_WARPS + warpid();
-        const int max_tile_idx = qblk * NUM_WARPS + NUM_WARPS - 1;
-        const int max_q_end_pos = (max_tile_idx + 1) * Q_BLOCK_SIZE;
-        int max_num_tiles = (max_q_end_pos + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
-        if constexpr (causal) max_num_tiles = min(max_num_tiles, num_tiles);
-        else max_num_tiles = num_tiles;
-        const int q_start_pos = tile_idx * Q_BLOCK_SIZE;
-        zero(o_reg);
-        zero(norm_vec);
-        ones(scale_vec);
-        if (pp)
+        const int q_lo = qx, q_hi = g.pair ? (numQ - 1 - qx) : qx;
+        for (int pp = 0; pp < 2; ++pp) {
+            const int qblk = pp ? q_lo : q_hi;
+            if (pp && q_lo == q_hi)
+                break;
+            const int tile_idx = qblk * NUM_WARPS + warpid();
+            const int max_tile_idx = qblk * NUM_WARPS + NUM_WARPS - 1;
+            const int max_q_end_pos = (max_tile_idx + 1) * Q_BLOCK_SIZE;
+            int max_num_tiles = (max_q_end_pos + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+            max_num_tiles = min(max_num_tiles, num_tiles);
+            const int q_start_pos = tile_idx * Q_BLOCK_SIZE;
+            zero(o_reg);
+            zero(norm_vec);
+            ones(scale_vec);
+            if (pp)
+                __builtin_amdgcn_s_barrier();
+
+            q_raw<D> q_raw_;
+            qload_issue(q_raw_, g.Qg, batch_idx, tile_idx, head_idx);
+            G::load<1, false>(k_smem[0], g.Kg, {batch_idx, 0, head_idx_kv, 0}, swizzled_offsets_K, k_srsrc_base, k_base,
+                              k_lds_base_0);
+            __builtin_amdgcn_s_waitcnt(0);
+            __builtin_amdgcn_sched_barrier(0);
             __builtin_amdgcn_s_barrier();
 
-    G::load<1, false>(k_smem[0], g.Kg, {batch_idx, 0, head_idx_kv, 0}, swizzled_offsets_K, k_srsrc_base, k_base, k_lds_base_0);
-    __builtin_amdgcn_s_waitcnt(0);
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-
-    {
-        qo_tile<D, float> q_reg_fl;
-        load<1, qo_tile<D, float>>(q_reg_fl, sat_gl(g.Qg), {batch_idx, tile_idx, head_idx, 0});
-        mul(q_reg_fl, q_reg_fl, TEMPERATURE_SCALE);
-        copy(q_reg, q_reg_fl);
-        #pragma unroll
-        for (int i = 0; i < q_reg.height; ++i)
-            #pragma unroll
-            for (int j = 0; j < q_reg.width; ++j)
+            {
+                qload_finish(q_reg, q_raw_);
                 #pragma unroll
-                for (int p = 0; p < q_reg.packed_per_base_tile; ++p)
-                    asm volatile("" : "+v"(q_reg.tiles[i][j].data[p]) :: "memory");
-    }
-
-    // All warps then collaboratively load in the first slice of V (V0) and the second slice of K (K1) into shared memory
-    G::load<1, false>(k_smem[1], g.Kg, {batch_idx, 1, head_idx_kv, 0}, swizzled_offsets_K, k_srsrc_base, k_base, k_lds_base_1);
-    // All warps then load in the first slice of K (K0)
-    G::load<1, false>(v_smem[0], g.Vg, {batch_idx, 0, head_idx_kv, 0}, swizzled_offsets_V, v_srsrc_base, v_base, v_lds_base_0);
-    {
-        load_pinned(k_reg, k_smem[0]);
-    }
-    __builtin_amdgcn_sched_barrier(0);
-    asm volatile("s_waitcnt lgkmcnt(0)");
-    asm volatile("s_waitcnt vmcnt(2)");
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-
-    // Each warp performs QK0
-    zero(att_block[0]);
-    mma_ABt(att_block[0], k_reg, q_reg, att_block[0]);
-    __builtin_amdgcn_sched_barrier(0); 
-    if constexpr (causal) { 
-        const int kv_end_pos = (1) * KV_BLOCK_SIZE;
-        if (__builtin_expect(q_start_pos < kv_end_pos, 0)) {  // Only mask if needed
-            mask_kv_tile(att_block[0], tile_idx, 0, neg_inf_v, lane);
-        }
-    }
-    // Each warp performs a partial softmax of QK0 (i.e. some of the online softmax up until but not including the second exponential scaling of the attention block likely)
-    col_max(max_vec, att_block[0]);
-    copy(max_vec_prev, max_vec);
-    sub_col(att_block[0], att_block[0], max_vec);
-    exp2(att_block[0].tiles[0][0], att_block[0].tiles[0][0]);
-    __builtin_amdgcn_sched_barrier(0);
-
-    if (stagger) {
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-    }
-
-    // __builtin_amdgcn_sched_barrier(0);
-    // All warps then load in the second slice of K (K1)
-    {
-        load_pinned(k_reg, k_smem[1]);
-    }
-    // All warps then collaboratively load in the third slice of K (K2) into shared memory
-    G::load<1, false>(k_smem[0], g.Kg, {batch_idx, 2, head_idx_kv, 0}, swizzled_offsets_K, k_srsrc_base, k_base, k_lds_base_0);
-    // All warps then collaboratively load in the second slice of V (V1) into shared memory 
-    G::load<1, false>(v_smem[1], g.Vg, {batch_idx, 1, head_idx_kv, 0}, swizzled_offsets_V, v_srsrc_base, v_base, v_lds_base_1);
-    asm volatile("s_waitcnt lgkmcnt(0)");
-    asm volatile("s_waitcnt vmcnt(4)");
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-
-    int pending_scale = 0;
-
-    // hot loop
-    #pragma unroll 
-    for (int j = 3; j < max_num_tiles - 1; j += 2) {
-        // Cluster 0:
-        //      QK1
-        zero(att_block[1]);
-        mma_ABt(att_block[1], k_reg, q_reg, att_block[1]);
-        //      Finish softmax for QK0
-        exp2(att_block[0].tiles[1][0], att_block[0].tiles[1][0]);
-        if (pending_scale) {
-            mul(norm_vec, norm_vec, scale_vec);
-        }
-        col_sum(norm_vec, att_block[0], norm_vec);
-        copy(att_block_bf16, att_block[0]);
-        att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
-        sched_barrier_exp_pairs<6, 3, 1>();
-        sched_barrier_pairs<10, 5, 1>();
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 1:
-        //      Load K3 into shared 
-        G::load<1, false>(k_smem[1], g.Kg, {batch_idx, j, head_idx_kv, 0}, swizzled_offsets_K, k_srsrc_base, k_base, k_lds_base_1);
-        //      Load V0 into registers
-        load(v_reg, v_smem[0]);
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        asm volatile("s_waitcnt vmcnt(4)");
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 2:
-        //      Rescale O for the max update in cluster 6, then A0V0
-        if (pending_scale) {
-            mul_col(o_reg, o_reg, scale_vec);
-        }
-        __builtin_amdgcn_s_setprio(1);
-        mma_AtB(o_reg, subtile_inplace<16>(v_reg, 0), subtile_inplace<16>(att_block_bf16_in, 0), o_reg);
-        //      Partial softmax for QK1
-        col_max(max_vec, att_block[1], max_vec_prev);
-        sched_barrier_pairs<4, 5, 2>();
-        int lane_ok = rv_all_below(max_vec_prev, max_vec, RESCALE_THRESHOLD);
-        int all_ok  = wave_all_ok(lane_ok);
-        if (__builtin_expect(all_ok, 1)) {
-            copy(max_vec, max_vec_prev);
-            pending_scale = 0;
-        } else {
-            sub(scale_vec, max_vec_prev, max_vec);   // diff = prev - new
-            exp2(scale_vec, scale_vec);
-            copy(max_vec_prev, max_vec);
-            pending_scale = 1;
-        }
-        mma_AtB(o_reg, subtile_inplace<16>(v_reg, 1), subtile_inplace<16>(att_block_bf16_in, 1), o_reg);
-        mma_AtB(o_reg, subtile_inplace<16>(v_reg, 2), subtile_inplace<16>(att_block_bf16_in, 2), o_reg);
-        mma_AtB(o_reg, subtile_inplace<16>(v_reg, 3), subtile_inplace<16>(att_block_bf16_in, 3), o_reg);
-        sub_col(att_block[1], att_block[1], max_vec);
-        exp2(att_block[1].tiles[0][0], att_block[1].tiles[0][0]);
-        sched_barrier_pairs<6, 5, 2>();
-        sched_barrier_exp_pairs<6, 3, 2>();
-        __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 3:
-        //      Load V2 into shared
-        G::load<1, false>(v_smem[0], g.Vg, {batch_idx, j - 1, head_idx_kv, 0}, swizzled_offsets_V, v_srsrc_base, v_base, v_lds_base_0);
-        //      Load K2 into registers
-        {
-            load_pinned(k_reg, k_smem[0]);
-        }
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        asm volatile("s_waitcnt vmcnt(4)");
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 4:
-        //      QK2
-        zero(att_block[0]);
-        mma_ABt(att_block[0], k_reg, q_reg, att_block[0]);
-        //      Finish softmax for QK1
-        exp2(att_block[1].tiles[1][0], att_block[1].tiles[1][0]);
-        if (pending_scale) {
-            mul(norm_vec, norm_vec, scale_vec);
-        }
-        col_sum(norm_vec, att_block[1], norm_vec);
-        copy(att_block_bf16, att_block[1]);
-        att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
-        sched_barrier_exp_pairs<6, 3, 3>();
-        sched_barrier_pairs<10, 5, 3>();
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 5:
-        //      Load K4 into shared
-        G::load<1, false>(k_smem[0], g.Kg, {batch_idx, j + 1, head_idx_kv, 0}, swizzled_offsets_K, k_srsrc_base, k_base, k_lds_base_0);
-        //      Load V1 into registers
-        load(v_reg, v_smem[1]);
-        if constexpr (causal) {
-            const int kv_end_pos = (j) * KV_BLOCK_SIZE;
-            if (q_start_pos < kv_end_pos) {  // Only mask if needed
-                mask_kv_tile(att_block[0], tile_idx, j - 1, neg_inf_v, lane);
+                for (int i = 0; i < q_reg.height; ++i)
+                    #pragma unroll
+                    for (int j = 0; j < q_reg.width; ++j)
+                        #pragma unroll
+                        for (int p = 0; p < q_reg.packed_per_base_tile; ++p)
+                            asm volatile("" : "+v"(q_reg.tiles[i][j].data[p]) :: "memory");
             }
-        }
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        asm volatile("s_waitcnt vmcnt(4)");
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
 
-        // Cluster 6:
-        //      Rescale O for the max update in cluster 2, then A1V1
-        if (pending_scale) {
-            mul_col(o_reg, o_reg, scale_vec);
-        }
-        __builtin_amdgcn_s_setprio(1);
-        mma_AtB(o_reg, subtile_inplace<16>(v_reg, 0), subtile_inplace<16>(att_block_bf16_in, 0), o_reg);
-        //      Partial softmax for QK2
-        col_max(max_vec, att_block[0], max_vec_prev);
-        sched_barrier_pairs<4, 5, 4>();
-        lane_ok = rv_all_below(max_vec_prev, max_vec, RESCALE_THRESHOLD);
-        all_ok  = wave_all_ok(lane_ok);
-        if (__builtin_expect(all_ok, 1)) {
-            copy(max_vec, max_vec_prev);
-            pending_scale = 0;
-        } else {
-            sub(scale_vec, max_vec_prev, max_vec);   // diff = prev - new
-            exp2(scale_vec, scale_vec);
+            // K1 and V0 into shared memory, K0 into registers.
+            G::load<1, false>(k_smem[1], g.Kg, {batch_idx, 1, head_idx_kv, 0}, swizzled_offsets_K, k_srsrc_base, k_base,
+                              k_lds_base_1);
+            G::load<1, false>(v_smem[0], g.Vg, {batch_idx, 0, head_idx_kv, 0}, swizzled_offsets_V, v_srsrc_base, v_base,
+                              v_lds_base_0);
+            {
+                load_pinned(k_reg, k_smem[0]);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            asm volatile("s_waitcnt vmcnt(%0)" ::"n"(memcpy_per_tile));
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            if constexpr (D == 128) {
+                if (ost_pend) {
+                    stage_o_flush<qo_tile<D, float, row_l, rt_32x32_s>>(sat_gl(g.Og),
+                        coord<qo_tile<D, float, row_l, rt_32x32_s>>{ost_b, ost_t, ost_h, 0}, ost_stage);
+                    store(g.L_vec, ost_lse, {ost_b, ost_h, 0, ost_t});
+                    ost_pend = 0;
+                }
+                __builtin_amdgcn_sched_barrier(0);
+            }
+
+            // QK0 and the first half of its softmax.
+            zero(att_block[0]);
+            mma_ABt(att_block[0], k_reg, q_reg, att_block[0]);
+            __builtin_amdgcn_sched_barrier(0);
+            {
+                const int kv_end_pos = (1) * KV_BLOCK_SIZE;
+                if (__builtin_expect(q_start_pos < kv_end_pos, 0)) {
+                    mask_kv_tile(att_block[0], tile_idx, 0, neg_inf_v, lane);
+                }
+            }
+            col_max(max_vec, att_block[0]);
+            rv_scale(max_vec, TEMPERATURE_SCALE);
             copy(max_vec_prev, max_vec);
-            pending_scale = 1;
-        }
-        mma_AtB(o_reg, subtile_inplace<16>(v_reg, 1), subtile_inplace<16>(att_block_bf16_in, 1), o_reg);
-        mma_AtB(o_reg, subtile_inplace<16>(v_reg, 2), subtile_inplace<16>(att_block_bf16_in, 2), o_reg);
-        mma_AtB(o_reg, subtile_inplace<16>(v_reg, 3), subtile_inplace<16>(att_block_bf16_in, 3), o_reg);
-        sub_col(att_block[0], att_block[0], max_vec);
-        exp2(att_block[0].tiles[0][0], att_block[0].tiles[0][0]);
-        sched_barrier_pairs<6, 5, 4>();
-        sched_barrier_exp_pairs<6, 3, 4>();
-        __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
+            sub_col_fma(att_block[0], att_block[0], TEMPERATURE_SCALE, max_vec);
+            exp2(att_block[0].tiles[0][0], att_block[0].tiles[0][0]);
+            __builtin_amdgcn_sched_barrier(0);
 
-        // Cluster 7:
-        //      Load V3 into shared
-        G::load<1, false>(v_smem[1], g.Vg, {batch_idx, j, head_idx_kv, 0}, swizzled_offsets_V, v_srsrc_base, v_base, v_lds_base_1);
-        //      Load K3 into registers
-        {
+            // Waves 4-7 run one cluster behind waves 0-3.
+            if (stagger) {
+                __builtin_amdgcn_sched_barrier(0);
+                __builtin_amdgcn_s_barrier();
+            }
+
+            // K1 into registers; K2 and V1 into shared memory.
+            {
+                load_pinned(k_reg, k_smem[1]);
+            }
+            G::load<1, false>(k_smem[0], g.Kg, {batch_idx, 2, head_idx_kv, 0}, swizzled_offsets_K, k_srsrc_base, k_base,
+                              k_lds_base_0);
+            G::load<1, false>(v_smem[1], g.Vg, {batch_idx, 1, head_idx_kv, 0}, swizzled_offsets_V, v_srsrc_base, v_base,
+                              v_lds_base_1);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            asm volatile("s_waitcnt vmcnt(%0)" ::"n"(2 * memcpy_per_tile));
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+
+            int pending_scale = 0;
+
+            // Hot loop: two key tiles per iteration, eight clusters separated by workgroup barriers.
+            #pragma unroll
+            for (int j = 3; j < max_num_tiles - 1; j += 2) {
+                // Cluster 0: QK1; finish the softmax of QK0.
+                zero(att_block[1]);
+                mma_ABt(att_block[1], k_reg, q_reg, att_block[1]);
+                exp2(att_block[0].tiles[1][0], att_block[0].tiles[1][0]);
+                if (pending_scale) {
+                    mul(norm_vec, norm_vec, scale_vec);
+                }
+                col_sum(norm_vec, att_block[0], norm_vec);
+                copy(att_block_bf16, att_block[0]);
+                att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
+                sched_barrier_exp_pairs<6, 3, 1>();
+                sched_barrier_pairs<10, 5, 1>();
+                __builtin_amdgcn_sched_barrier(0);
+                __builtin_amdgcn_s_barrier();
+                __builtin_amdgcn_sched_barrier(0);
+
+                // Cluster 1: K3 into shared memory, V0 into registers; rescale O for the max update of cluster 6.
+                G::load<1, false>(k_smem[1], g.Kg, {batch_idx, j, head_idx_kv, 0}, swizzled_offsets_K, k_srsrc_base,
+                                  k_base, k_lds_base_1);
+                load(v_reg, v_smem[0]);
+                if (pending_scale) {
+                    mul_col(o_reg, o_reg, scale_vec);
+                }
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                asm volatile("s_waitcnt vmcnt(%0)" ::"n"(2 * memcpy_per_tile));
+                __builtin_amdgcn_sched_barrier(0);
+                __builtin_amdgcn_s_barrier();
+                __builtin_amdgcn_sched_barrier(0);
+
+                // Cluster 2: A0V0; partial softmax of QK1.
+                __builtin_amdgcn_s_setprio(1);
+                mma_AtB(o_reg, subtile_inplace<16>(v_reg, 0), subtile_inplace<16>(att_block_bf16_in, 0), o_reg);
+                col_max(max_vec, att_block[1]);
+                sched_barrier_pairs<4, 5, 2>();
+                int lane_ok = rv_all_below_fma(max_vec_prev, max_vec, TEMPERATURE_SCALE, RESCALE_THRESHOLD);
+                rv_scale_merge(max_vec, max_vec_prev, TEMPERATURE_SCALE);
+                int all_ok  = wave_all_ok(lane_ok);
+                if (__builtin_expect(all_ok, 1)) {
+                    copy(max_vec, max_vec_prev);
+                    pending_scale = 0;
+                } else {
+                    sub(scale_vec, max_vec_prev, max_vec);   // diff = prev - new
+                    exp2(scale_vec, scale_vec);
+                    copy(max_vec_prev, max_vec);
+                    pending_scale = 1;
+                }
+                mma_AtB(o_reg, subtile_inplace<16>(v_reg, 1), subtile_inplace<16>(att_block_bf16_in, 1), o_reg);
+                mma_AtB(o_reg, subtile_inplace<16>(v_reg, 2), subtile_inplace<16>(att_block_bf16_in, 2), o_reg);
+                mma_AtB(o_reg, subtile_inplace<16>(v_reg, 3), subtile_inplace<16>(att_block_bf16_in, 3), o_reg);
+                sub_col_fma(att_block[1], att_block[1], TEMPERATURE_SCALE, max_vec);
+                exp2(att_block[1].tiles[0][0], att_block[1].tiles[0][0]);
+                sched_barrier_pairs<6, 5, 2>();
+                sched_barrier_exp_pairs<6, 3, 2>();
+                __builtin_amdgcn_s_setprio(0);
+                __builtin_amdgcn_sched_barrier(0);
+                __builtin_amdgcn_s_barrier();
+                __builtin_amdgcn_sched_barrier(0);
+
+                // Cluster 3: V2 into shared memory, K2 into registers.
+                G::load<1, false>(v_smem[0], g.Vg, {batch_idx, j - 1, head_idx_kv, 0}, swizzled_offsets_V,
+                                  v_srsrc_base, v_base, v_lds_base_0);
+                {
+                    load_pinned(k_reg, k_smem[0]);
+                }
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                asm volatile("s_waitcnt vmcnt(%0)" ::"n"(2 * memcpy_per_tile));
+                __builtin_amdgcn_sched_barrier(0);
+                __builtin_amdgcn_s_barrier();
+                __builtin_amdgcn_sched_barrier(0);
+
+                // Cluster 4: QK2; finish the softmax of QK1.
+                zero(att_block[0]);
+                mma_ABt(att_block[0], k_reg, q_reg, att_block[0]);
+                exp2(att_block[1].tiles[1][0], att_block[1].tiles[1][0]);
+                if (pending_scale) {
+                    mul(norm_vec, norm_vec, scale_vec);
+                }
+                col_sum(norm_vec, att_block[1], norm_vec);
+                copy(att_block_bf16, att_block[1]);
+                att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
+                sched_barrier_exp_pairs<6, 3, 3>();
+                sched_barrier_pairs<10, 5, 3>();
+                __builtin_amdgcn_sched_barrier(0);
+                __builtin_amdgcn_s_barrier();
+                __builtin_amdgcn_sched_barrier(0);
+
+                // Cluster 5: K4 into shared memory, V1 into registers; mask QK2; rescale O for cluster 2's update.
+                G::load<1, false>(k_smem[0], g.Kg, {batch_idx, j + 1, head_idx_kv, 0}, swizzled_offsets_K,
+                                  k_srsrc_base, k_base, k_lds_base_0);
+                load(v_reg, v_smem[1]);
+                {
+                    const int kv_end_pos = (j) * KV_BLOCK_SIZE;
+                    if (q_start_pos < kv_end_pos) {
+                        mask_kv_tile(att_block[0], tile_idx, j - 1, neg_inf_v, lane);
+                    }
+                }
+                if (pending_scale) {
+                    mul_col(o_reg, o_reg, scale_vec);
+                }
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                asm volatile("s_waitcnt vmcnt(%0)" ::"n"(2 * memcpy_per_tile));
+                __builtin_amdgcn_sched_barrier(0);
+                __builtin_amdgcn_s_barrier();
+                __builtin_amdgcn_sched_barrier(0);
+
+                // Cluster 6: A1V1; partial softmax of QK2.
+                __builtin_amdgcn_s_setprio(1);
+                mma_AtB(o_reg, subtile_inplace<16>(v_reg, 0), subtile_inplace<16>(att_block_bf16_in, 0), o_reg);
+                col_max(max_vec, att_block[0]);
+                sched_barrier_pairs<4, 5, 4>();
+                lane_ok = rv_all_below_fma(max_vec_prev, max_vec, TEMPERATURE_SCALE, RESCALE_THRESHOLD);
+                rv_scale_merge(max_vec, max_vec_prev, TEMPERATURE_SCALE);
+                all_ok  = wave_all_ok(lane_ok);
+                if (__builtin_expect(all_ok, 1)) {
+                    copy(max_vec, max_vec_prev);
+                    pending_scale = 0;
+                } else {
+                    sub(scale_vec, max_vec_prev, max_vec);   // diff = prev - new
+                    exp2(scale_vec, scale_vec);
+                    copy(max_vec_prev, max_vec);
+                    pending_scale = 1;
+                }
+                mma_AtB(o_reg, subtile_inplace<16>(v_reg, 1), subtile_inplace<16>(att_block_bf16_in, 1), o_reg);
+                mma_AtB(o_reg, subtile_inplace<16>(v_reg, 2), subtile_inplace<16>(att_block_bf16_in, 2), o_reg);
+                mma_AtB(o_reg, subtile_inplace<16>(v_reg, 3), subtile_inplace<16>(att_block_bf16_in, 3), o_reg);
+                sub_col_fma(att_block[0], att_block[0], TEMPERATURE_SCALE, max_vec);
+                exp2(att_block[0].tiles[0][0], att_block[0].tiles[0][0]);
+                sched_barrier_pairs<6, 5, 4>();
+                sched_barrier_exp_pairs<6, 3, 4>();
+                __builtin_amdgcn_s_setprio(0);
+                __builtin_amdgcn_sched_barrier(0);
+                __builtin_amdgcn_s_barrier();
+                __builtin_amdgcn_sched_barrier(0);
+
+                // Cluster 7: V3 into shared memory, K3 into registers.
+                G::load<1, false>(v_smem[1], g.Vg, {batch_idx, j, head_idx_kv, 0}, swizzled_offsets_V, v_srsrc_base,
+                                  v_base, v_lds_base_1);
+                {
+                    load_pinned(k_reg, k_smem[1]);
+                }
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                asm volatile("s_waitcnt vmcnt(%0)" ::"n"(2 * memcpy_per_tile));
+                __builtin_amdgcn_sched_barrier(0);
+                __builtin_amdgcn_s_barrier();
+                __builtin_amdgcn_sched_barrier(0);
+            }
+
+            // Epilogue: the last three tiles (QK3..QK5 = tiles max_num_tiles-3 .. -1). NL = how many of them hold a
+            // key visible to this wave (wave-uniform); the others skip their QK and PV MFMAs, mask and softmax (P
+            // would be 0). Tile zeroing, register loads, the bf16 P copy, LDS loads, waits and barriers always run.
+            const int NL = __builtin_amdgcn_readfirstlane(
+                min(3, max(0, (q_start_pos + Q_BLOCK_SIZE - 1) / KV_BLOCK_SIZE - (max_num_tiles - 4))));
+            // Cluster 0: QK3; finish the softmax of QK2.
+            zero(att_block[1]);
+            if (NL >= 1)
+                mma_ABt(att_block[1], k_reg, q_reg, att_block[1]);
+            exp2(att_block[0].tiles[1][0], att_block[0].tiles[1][0]);
+            if (pending_scale) {
+                mul(norm_vec, norm_vec, scale_vec);
+            }
+
+            col_sum(norm_vec, att_block[0], norm_vec);
+            copy(att_block_bf16, att_block[0]);
+            att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
+            sched_barrier_exp_pairs<6, 3, 5>();
+            if (NL >= 1)
+                sched_barrier_pairs<10, 5, 5>();
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
+
+            // Cluster 1: K5 into shared memory, V2 into registers; mask QK3.
+            G::load<1, false>(k_smem[1], g.Kg, {batch_idx, max_num_tiles - 1, head_idx_kv, 0}, swizzled_offsets_K,
+                              k_srsrc_base, k_base, k_lds_base_1);
+            load(v_reg, v_smem[0]);
+            if (NL >= 1) {
+                const int kv_end_pos = (max_num_tiles - 2) * KV_BLOCK_SIZE;
+                if (__builtin_expect(q_start_pos < kv_end_pos, 0)) {
+                    mask_kv_tile(att_block[1], tile_idx, max_num_tiles - 3, neg_inf_v, lane);
+                }
+            }
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            asm volatile("s_waitcnt vmcnt(%0)" ::"n"(2 * memcpy_per_tile));
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
+
+            // Cluster 2: rescale O for the last hot-loop max update, then A2V2; partial softmax of QK3.
+            if (pending_scale) {
+                mul_col(o_reg, o_reg, scale_vec);
+            }
+            __builtin_amdgcn_s_setprio(1);
+            mma_AtB(o_reg, v_reg, att_block_bf16_in, o_reg);
+            if (NL >= 1) {
+                col_max(max_vec, att_block[1]);
+                rv_scale_merge(max_vec, max_vec_prev, TEMPERATURE_SCALE);
+                sub(scale_vec, max_vec_prev, max_vec);
+                copy(max_vec_prev, max_vec);
+                exp2(scale_vec, scale_vec);
+                sub_col_fma(att_block[1], att_block[1], TEMPERATURE_SCALE, max_vec);
+                exp2(att_block[1].tiles[0][0], att_block[1].tiles[0][0]);
+                sched_barrier_pairs<10, 5, 6>();
+                sched_barrier_exp_pairs<6, 3, 6>();
+                __builtin_amdgcn_sched_barrier(0);
+                mul_col(o_reg, o_reg, scale_vec);
+            }
+            __builtin_amdgcn_s_setprio(0);
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
+
+            // Cluster 3: V4 into shared memory, K4 into registers.
+            G::load<1, false>(v_smem[0], g.Vg, {batch_idx, max_num_tiles - 2, head_idx_kv, 0}, swizzled_offsets_V,
+                              v_srsrc_base, v_base, v_lds_base_0);
+            load_pinned(k_reg, k_smem[0]);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            asm volatile("s_waitcnt vmcnt(%0)" ::"n"(2 * memcpy_per_tile));
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
+
+            // Cluster 4: QK4; finish the softmax of QK3.
+            zero(att_block[0]);
+            if (NL >= 2)
+                mma_ABt(att_block[0], k_reg, q_reg, att_block[0]);
+            if (NL >= 1) {
+                exp2(att_block[1].tiles[1][0], att_block[1].tiles[1][0]);
+                mul(norm_vec, norm_vec, scale_vec);
+                col_sum(norm_vec, att_block[1], norm_vec);
+            }
+            copy(att_block_bf16, att_block[1]);
+            att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
+            sched_barrier_exp_pairs<6, 3, 7>();
+            sched_barrier_pairs<10, 5, 7>();
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
+
+            // Cluster 5: V3 into registers; mask QK4.
+            load(v_reg, v_smem[1]);
+            if (NL >= 2) {
+                const int kv_end_pos = (max_num_tiles - 1) * KV_BLOCK_SIZE;
+                if (__builtin_expect(q_start_pos < kv_end_pos, 1)) {
+                    mask_kv_tile(att_block[0], tile_idx, max_num_tiles - 2, neg_inf_v, lane);
+                }
+            }
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            asm volatile("s_waitcnt vmcnt(%0)" ::"n"(memcpy_per_tile));
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
+
+            // Cluster 6: A3V3; partial softmax of QK4.
+            __builtin_amdgcn_s_setprio(1);
+            if (NL >= 1)
+                mma_AtB(o_reg, v_reg, att_block_bf16_in, o_reg);
+            if (NL >= 2) {
+                col_max(max_vec, att_block[0]);
+                rv_scale_merge(max_vec, max_vec_prev, TEMPERATURE_SCALE);
+                sub(scale_vec, max_vec_prev, max_vec);
+                copy(max_vec_prev, max_vec);
+                exp2(scale_vec, scale_vec);
+                sub_col_fma(att_block[0], att_block[0], TEMPERATURE_SCALE, max_vec);
+                exp2(att_block[0].tiles[0][0], att_block[0].tiles[0][0]);
+                sched_barrier_pairs<10, 5, 8>();
+                sched_barrier_exp_pairs<6, 3, 8>();
+                __builtin_amdgcn_sched_barrier(0);
+                mul_col(o_reg, o_reg, scale_vec);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
+
+            // Cluster 7: V5 into shared memory, K5 into registers.
+            G::load<1, false>(v_smem[1], g.Vg, {batch_idx, max_num_tiles - 1, head_idx_kv, 0}, swizzled_offsets_V,
+                              v_srsrc_base, v_base, v_lds_base_1);
             load_pinned(k_reg, k_smem[1]);
-        }
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        asm volatile("s_waitcnt vmcnt(4)");
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-    }
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            asm volatile("s_waitcnt vmcnt(%0)" ::"n"(memcpy_per_tile));
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
 
-    // Epilogue
-    // Cluster 0:
-    //      QK3
-    zero(att_block[1]);
-    mma_ABt(att_block[1], k_reg, q_reg, att_block[1]);
-    //      Finish softmax for QK2
-    exp2(att_block[0].tiles[1][0], att_block[0].tiles[1][0]);
-    if (pending_scale) {
-        mul(norm_vec, norm_vec, scale_vec);
-    }
+            // Cluster 8: QK5; finish the softmax of QK4.
+            zero(att_block[1]);
+            if (NL >= 3)
+                mma_ABt(att_block[1], k_reg, q_reg, att_block[1]);
+            if (NL >= 2) {
+                exp2(att_block[0].tiles[1][0], att_block[0].tiles[1][0]);
+                mul(norm_vec, norm_vec, scale_vec);
+                col_sum(norm_vec, att_block[0], norm_vec);
+            }
+            copy(att_block_bf16, att_block[0]);
+            att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
+            sched_barrier_exp_pairs<6, 3, 9>();
+            sched_barrier_pairs<10, 5, 9>();
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
 
-    col_sum(norm_vec, att_block[0], norm_vec);
-    copy(att_block_bf16, att_block[0]);
-    att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
-    sched_barrier_exp_pairs<6, 3, 5>();
-    sched_barrier_pairs<10, 5, 5>();
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+            // Cluster 9: V4 into registers; mask QK5.
+            load(v_reg, v_smem[0]);
+            if (NL >= 3) {
+                const int kv_end_pos = (max_num_tiles) * KV_BLOCK_SIZE;
+                if (__builtin_expect(q_start_pos < kv_end_pos, 1)) {
+                    mask_kv_tile(att_block[1], tile_idx, max_num_tiles - 1, neg_inf_v, lane);
+                }
+            }
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            asm volatile("s_waitcnt vmcnt(0)");
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
 
-    // Cluster 1:
-    //      Load K5 into shared
-    G::load<1, false>(k_smem[1], g.Kg, {batch_idx, max_num_tiles - 1, head_idx_kv, 0}, swizzled_offsets_K, k_srsrc_base, k_base, k_lds_base_1);
-    //      Load V2 into registers
-    load(v_reg, v_smem[0]);
-    if constexpr (causal) {
-        const int kv_end_pos = (max_num_tiles - 2) * KV_BLOCK_SIZE;
-        if (__builtin_expect(q_start_pos < kv_end_pos, 0)) {  // Only mask if needed
-            mask_kv_tile(att_block[1], tile_idx, max_num_tiles - 3, neg_inf_v, lane);
-        }
-    }
-    asm volatile("s_waitcnt lgkmcnt(0)");
-    asm volatile("s_waitcnt vmcnt(4)");
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+            // Cluster 10: A4V4; full softmax of QK5.
+            if (NL >= 2)
+                mma_AtB(o_reg, v_reg, att_block_bf16_in, o_reg);
+            if (NL >= 3) {
+                col_max(max_vec, att_block[1]);
+                rv_scale_merge(max_vec, max_vec_prev, TEMPERATURE_SCALE);
+                sub(scale_vec, max_vec_prev, max_vec);
+                copy(max_vec_prev, max_vec);
+                exp2(scale_vec, scale_vec);
 
-    // Cluster 2:
-    //      Rescale O for the last hot loop max update, then A2V2
-    if (pending_scale) {
-        mul_col(o_reg, o_reg, scale_vec);
-    }
-    __builtin_amdgcn_s_setprio(1);
-    mma_AtB(o_reg, v_reg, att_block_bf16_in, o_reg);
-    //      Partial softmax for QK3
-    col_max(max_vec, att_block[1], max_vec_prev);
-    sub(scale_vec, max_vec_prev, max_vec);
-    copy(max_vec_prev, max_vec);
-    exp2(scale_vec, scale_vec);
-    sub_col(att_block[1], att_block[1], max_vec);
-    exp2(att_block[1].tiles[0][0], att_block[1].tiles[0][0]);
-    sched_barrier_pairs<10, 5, 6>();
-    sched_barrier_exp_pairs<6, 3, 6>();
-    __builtin_amdgcn_sched_barrier(0);
-    mul_col(o_reg, o_reg, scale_vec);
-    __builtin_amdgcn_s_setprio(0);
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+                sub_col_fma(att_block[1], att_block[1], TEMPERATURE_SCALE, max_vec);
+                exp2(att_block[1].tiles[0][0], att_block[1].tiles[0][0]);
+                sched_barrier_pairs<10, 5, 10>();
+                sched_barrier_exp_pairs<6, 3, 10>();
+                __builtin_amdgcn_sched_barrier(0);
 
-    // Cluster 3:
-    //      Load V4 into shared
-    G::load<1, false>(v_smem[0], g.Vg, {batch_idx, max_num_tiles - 2, head_idx_kv, 0}, swizzled_offsets_V, v_srsrc_base, v_base, v_lds_base_0);
-    //      Load K4 into registers
-    {
-        load_pinned(k_reg, k_smem[0]);
-    }
-    asm volatile("s_waitcnt lgkmcnt(0)");
-    asm volatile("s_waitcnt vmcnt(4)");
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+                exp2(att_block[1].tiles[1][0], att_block[1].tiles[1][0]);
+                mul(norm_vec, norm_vec, scale_vec);
 
-    // Cluster 4:
-    //      QK4
-    zero(att_block[0]);
-    mma_ABt(att_block[0], k_reg, q_reg, att_block[0]);
-    //      Finish softmax for QK3
-    exp2(att_block[1].tiles[1][0], att_block[1].tiles[1][0]);
-    mul(norm_vec, norm_vec, scale_vec);
-    col_sum(norm_vec, att_block[1], norm_vec);
-    copy(att_block_bf16, att_block[1]);
-    att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
-    sched_barrier_exp_pairs<6, 3, 7>();
-    sched_barrier_pairs<10, 5, 7>();
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+                col_sum(norm_vec, att_block[1], norm_vec);
+                __builtin_amdgcn_sched_barrier(0);
+                mul_col(o_reg, o_reg, scale_vec);
+            }
+            copy(att_block_bf16, att_block[1]);
+            att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
 
-    // Cluster 5:
-    //      Load V3 into registers
-    load(v_reg, v_smem[1]);
-    if constexpr (causal) {
-        const int kv_end_pos = (max_num_tiles - 1) * KV_BLOCK_SIZE;
-        if (__builtin_expect(q_start_pos < kv_end_pos, 1)) {  // Only mask if needed
-            mask_kv_tile(att_block[0], tile_idx, max_num_tiles - 2, neg_inf_v, lane);
-        }
-    }
-    asm volatile("s_waitcnt lgkmcnt(0)");
-    asm volatile("s_waitcnt vmcnt(2)");
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+            // Cluster 11: V5 into registers.
+            load(v_reg, v_smem[1]);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
 
-    // Cluster 6:
-    //      A3V3
-    __builtin_amdgcn_s_setprio(1);
-    mma_AtB(o_reg, v_reg, att_block_bf16_in, o_reg);
-    //      Partial softmax for QK4
-    col_max(max_vec, att_block[0], max_vec_prev);
-    sub(scale_vec, max_vec_prev, max_vec);
-    copy(max_vec_prev, max_vec);
-    exp2(scale_vec, scale_vec);
-    sub_col(att_block[0], att_block[0], max_vec);
-    exp2(att_block[0].tiles[0][0], att_block[0].tiles[0][0]);
-    sched_barrier_pairs<10, 5, 8>();
-    sched_barrier_exp_pairs<6, 3, 8>();
-    __builtin_amdgcn_sched_barrier(0);
-    mul_col(o_reg, o_reg, scale_vec);
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+            // Cluster 12: A5V5, then O / l.
+            if (NL >= 3)
+                mma_AtB(o_reg, v_reg, att_block_bf16_in, o_reg);
+            div_col(o_reg, o_reg, norm_vec);
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
 
-    // Cluster 7:
-    //      Load V5 into shared
-    G::load<1, false>(v_smem[1], g.Vg, {batch_idx, max_num_tiles - 1, head_idx_kv, 0}, swizzled_offsets_V, v_srsrc_base, v_base, v_lds_base_1);
-    //      Load K5 into registers
-    {
-        load_pinned(k_reg, k_smem[1]);
-    }
-    asm volatile("s_waitcnt lgkmcnt(0)");
-    asm volatile("s_waitcnt vmcnt(2)");
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+            // Realign the two wave groups.
+            if (!stagger) {
+                __builtin_amdgcn_s_barrier();
+            }
 
-    // Cluster 8:
-    //      QK5
-    zero(att_block[1]);
-    mma_ABt(att_block[1], k_reg, q_reg, att_block[1]);
-    //      Finish softmax for QK4
-    exp2(att_block[0].tiles[1][0], att_block[0].tiles[1][0]);
-    mul(norm_vec, norm_vec, scale_vec);
-    col_sum(norm_vec, att_block[0], norm_vec);
-    copy(att_block_bf16, att_block[0]);
-    att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
-    sched_barrier_exp_pairs<6, 3, 9>();
-    sched_barrier_pairs<10, 5, 9>();
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+            qo_tile<D, float, row_l, rt_32x32_s> o_reg_transposed;
+            transpose(o_reg_transposed, o_reg);
+            if constexpr (D == 128) {
+                stage_o_write(o_reg_transposed, ost_stage);
+            } else
+                store<1>(sat_gl(g.Og), o_reg_transposed, {batch_idx, tile_idx, head_idx, 0});
 
-    // Cluster 9:
-    //      Load V4 into registers
-    load(v_reg, v_smem[0]);
-    if constexpr (causal) {
-        const int kv_end_pos = (max_num_tiles) * KV_BLOCK_SIZE;
-        if (__builtin_expect(q_start_pos < kv_end_pos, 1)) {  // Only mask if needed
-            mask_kv_tile(att_block[1], tile_idx, max_num_tiles - 1, neg_inf_v, lane);
+            // LSE = m * ln 2 + log(l).
+            mul(max_vec, max_vec, 0.69314718056f);
+            log(norm_vec, norm_vec);
+            add(norm_vec, norm_vec, max_vec);
+            if constexpr (D == 128) {
+                ost_lse = norm_vec;
+                ost_b = batch_idx; ost_t = tile_idx; ost_h = head_idx;
+                ost_pend = 1;
+            } else
+                store(g.L_vec, norm_vec, {batch_idx, head_idx, 0, tile_idx});
+        } // Q-pair pass
+    } // persistent job
+    if constexpr (D == 128) {
+        if (ost_pend) {
+            stage_o_flush<qo_tile<D, float, row_l, rt_32x32_s>>(sat_gl(g.Og),
+                coord<qo_tile<D, float, row_l, rt_32x32_s>>{ost_b, ost_t, ost_h, 0}, ost_stage);
+            store(g.L_vec, ost_lse, {ost_b, ost_h, 0, ost_t});
         }
     }
-    asm volatile("s_waitcnt lgkmcnt(0)");
-    asm volatile("s_waitcnt vmcnt(0)");
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 10:
-    //      A4V4
-    mma_AtB(o_reg, v_reg, att_block_bf16_in, o_reg);
-    //      Full softmax for QK5
-    col_max(max_vec, att_block[1], max_vec_prev);
-    sub(scale_vec, max_vec_prev, max_vec);
-    copy(max_vec_prev, max_vec);
-    exp2(scale_vec, scale_vec);
-
-    sub_col(att_block[1], att_block[1], max_vec);
-    exp2(att_block[1].tiles[0][0], att_block[1].tiles[0][0]);
-    sched_barrier_pairs<10, 5, 10>();
-    sched_barrier_exp_pairs<6, 3, 10>();
-    __builtin_amdgcn_sched_barrier(0);
-
-    exp2(att_block[1].tiles[1][0], att_block[1].tiles[1][0]);
-    mul(norm_vec, norm_vec, scale_vec);
-
-    col_sum(norm_vec, att_block[1], norm_vec);
-    copy(att_block_bf16, att_block[1]);
-    att_block_bf16_in = *reinterpret_cast<attn_tile<D, bf16, col_l, rt_16x32_4_s>*>(&att_block_bf16);
-
-    __builtin_amdgcn_sched_barrier(0);
-    mul_col(o_reg, o_reg, scale_vec);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 11:
-    //      Load V5 into registers
-    load(v_reg, v_smem[1]);
-    asm volatile("s_waitcnt lgkmcnt(0)");
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 12:
-    //      A5V5
-    mma_AtB(o_reg, v_reg, att_block_bf16_in, o_reg);
-    div_col(o_reg, o_reg, norm_vec);
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Conclusion
-    if (!stagger) {
-        __builtin_amdgcn_s_barrier();
-    }
-
-    qo_tile<D, float, row_l, rt_32x32_s> o_reg_transposed;
-    transpose(o_reg_transposed, o_reg);
-    store<1>(sat_gl(g.Og), o_reg_transposed, {batch_idx, tile_idx, head_idx, 0});
-
-    // multiply by ln(2)
-    mul(max_vec, max_vec, 0.69314718056f);
-    log(norm_vec, norm_vec);
-    add(norm_vec, norm_vec, max_vec);
-    store(g.L_vec, norm_vec, {batch_idx, head_idx, 0, tile_idx});
-    } // Q-pair pass
-    } // persist job
 }
 
 
 template<int D, bool Bshd>
 void dispatch_micro(attn_globals<D, Bshd> g) {
-    g.nxcd = 8;
-    if (const char *e = std::getenv("ZK_FMHA_NXCD")) {
-        const int v = std::atoi(e);
-        if (v > 0) g.nxcd = v;
-    } else {
-        int dev = 0, v = 0;
-        if (hipGetDevice(&dev) == hipSuccess &&
-            hipDeviceGetAttribute(&v, hipDeviceAttributeNumberOfXccs, dev) == hipSuccess && v > 0)
-            g.nxcd = v;
-    }
-    // D=64: q-pair is unsafe after other D=64 kernels on the same device
-    // (AITER hd64 leaves the next pair launch producing ±Inf). Single Q
-    // group matches upstream HK d64 and stays correct under the validate order.
+    g.nxcd = fmha_device_xcds();
+    // D = 64 runs one Q block per job (no causal pairing).
     g.pair = (D >= 128) ? 1 : 0;
-    if (const char *e = std::getenv("ZK_FMHA_NO_PAIR"); e && std::atoi(e) == 1)
-        g.pair = 0;
-    if (const char *e = std::getenv("ZK_FMHA_FORCE_PAIR"); e && std::atoi(e) == 1)
-        g.pair = 1;
     unsigned long mem_size = g.dynamic_shared_memory();
-    hipFuncSetAttribute((void*)attend_ker<D, Bshd>, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    hip_check(hipFuncSetAttribute((void*)attend_ker<D, Bshd>, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size), "hipFuncSetAttribute");
     hipLaunchKernelGGL((attend_ker<D, Bshd>), dim3(g.grid()), dim3(g.block()), mem_size, g.stream, g);
 }
 
@@ -958,7 +1065,12 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
                                    bool return_lse, bool bshd) {
     TORCH_CHECK(causal, "fmha_bf16 is causal-only");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
-    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "fmha_bf16 needs bfloat16");
+    TORCH_CHECK(k.device() == q.device() && v.device() == q.device(), "q, k, v must be on the same device");
+    const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && k.scalar_type() == at::kBFloat16 &&
+                    v.scalar_type() == at::kBFloat16,
+                "fmha_bf16 needs bfloat16");
+    TORCH_CHECK(fmha_scale_finite(scale), "fmha_bf16 needs a finite scale");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
                 bshd ? "q,k,v must be BSHD [B,S,H,D]" : "q,k,v must be BHSD [B,H,S,D]");
     q = q.contiguous();
@@ -971,7 +1083,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     const int N = bshd ? k.size(1) : k.size(2);
     TORCH_CHECK(D == 128 && Dv == 128 && M % 256 == 0 && N % 64 == 0 && N >= 256);
     TORCH_CHECK(M == N, "fmha_bf16 needs equal query and key lengths, got M=", M, " N=", N);
-    TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
+    TORCH_CHECK(Hkv > 0 && Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
     if (bshd) {
         TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);
     } else {
@@ -980,16 +1092,20 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     auto O = bshd ? torch::empty({B, M, Hq, Dv}, q.options().dtype(at::kBFloat16))
                   : torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kBFloat16));
     torch::Tensor Lse = torch::empty({B, Hq, 1, M}, q.options().dtype(at::kFloat));
+    if (B == 0 || Hq == 0 || M == 0)
+        return return_lse ? std::vector<torch::Tensor>{O, Lse.reshape({B * Hq, M})} : std::vector<torch::Tensor>{O};
     const int numQ = (M / Q_BLOCK_SIZE + NUM_WARPS - 1) / NUM_WARPS;
-    int nq_map = (numQ + 1) / 2;
-    if (const char *e = std::getenv("ZK_FMHA_NO_PAIR"); e && std::atoi(e) == 1)
-        nq_map = numQ;
+    const int nq_map = (numQ + 1) / 2;
     const bool split = fmha_split_batch(B, nq_map, Hq, fmha_num_xcds(), M);
     const int batches = split ? B : 1;
     const int B_launch = split ? 1 : B;
     const size_t q_batch = (size_t)M * Hq * D;
     const size_t kv_batch = (size_t)N * Hkv * D;
-    const float sc = (float)scale * L2E;
+    // The kernel scales the row max of the raw scores, so scale >= 0. c = scale * log2(e) is kept >= FLT_MIN: a zero
+    // or denormal c flushes to 0 on the GPU and masked -inf * 0 is NaN.
+    TORCH_CHECK(scale >= 0, "fmha_bf16 d128 needs scale >= 0");
+    const float sc_raw = (float)scale * L2E;
+    const float sc = sc_raw < 1.17549435e-38f ? 1.17549435e-38f : sc_raw;
     auto launch = [&](auto bshd_tag) {
         constexpr bool Bshd = decltype(bshd_tag)::value;
         for (int b = 0; b < batches; ++b) {
@@ -1026,82 +1142,3 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
 }
 
 } // namespace fmha_bf16_d128
-
-namespace fmha_bf16_d64 {
-
-constexpr float L2E = 1.4426950408889634f;
-
-std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, bool causal,
-                                   bool return_lse, bool bshd) {
-    TORCH_CHECK(causal, "fmha_bf16 is causal-only");
-    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
-    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "fmha_bf16 needs bfloat16");
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
-                bshd ? "q,k,v must be BSHD [B,S,H,D]" : "q,k,v must be BHSD [B,H,S,D]");
-    q = q.contiguous();
-    k = k.contiguous();
-    v = v.contiguous();
-    const int B = q.size(0), D = q.size(3), Dv = v.size(3);
-    const int Hq = bshd ? q.size(2) : q.size(1);
-    const int M = bshd ? q.size(1) : q.size(2);
-    const int Hkv = bshd ? k.size(2) : k.size(1);
-    const int N = bshd ? k.size(1) : k.size(2);
-    TORCH_CHECK(D == 64 && Dv == 64 && M % 256 == 0 && N % 64 == 0 && N >= 256);
-    TORCH_CHECK(M == N, "fmha_bf16 needs equal query and key lengths, got M=", M, " N=", N);
-    TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
-    if (bshd) {
-        TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);
-    } else {
-        TORCH_CHECK(v.size(1) == Hkv && v.size(2) == N);
-    }
-    auto O = bshd ? torch::empty({B, M, Hq, Dv}, q.options().dtype(at::kBFloat16))
-                  : torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kBFloat16));
-    torch::Tensor Lse = torch::empty({B, Hq, 1, M}, q.options().dtype(at::kFloat));
-    const int numQ = (M / Q_BLOCK_SIZE + NUM_WARPS - 1) / NUM_WARPS;
-    // Host-side nq_map must match dispatch_micro: D=64 defaults to no pair.
-    int nq_map = numQ;
-    if (const char *e = std::getenv("ZK_FMHA_FORCE_PAIR"); e && std::atoi(e) == 1)
-        nq_map = (numQ + 1) / 2;
-    // D=64 fused B>1 is incorrect (Inf / large error). Always split B.
-    const bool split = B > 1 || fmha_split_batch(B, nq_map, Hq, fmha_num_xcds(), M);
-    const int batches = split ? B : 1;
-    const int B_launch = split ? 1 : B;
-    const size_t q_batch = (size_t)M * Hq * D;
-    const size_t kv_batch = (size_t)N * Hkv * D;
-    const float sc = (float)scale * L2E;
-    auto launch = [&](auto bshd_tag) {
-        constexpr bool Bshd = decltype(bshd_tag)::value;
-        for (int b = 0; b < batches; ++b) {
-            const uint64_t qoff = (uint64_t)b * q_batch * sizeof(uint16_t);
-            const uint64_t kvoff = (uint64_t)b * kv_batch * sizeof(uint16_t);
-            auto *qp = reinterpret_cast<bf16 *>(reinterpret_cast<uint8_t *>(q.data_ptr()) + qoff);
-            auto *kp = reinterpret_cast<bf16 *>(reinterpret_cast<uint8_t *>(k.data_ptr()) + kvoff);
-            auto *vp = reinterpret_cast<bf16 *>(reinterpret_cast<uint8_t *>(v.data_ptr()) + kvoff);
-            auto *op = reinterpret_cast<bf16 *>(reinterpret_cast<uint8_t *>(O.data_ptr()) + qoff);
-            attn_globals<64, Bshd> g{
-                gl_view<bf16, Bshd>(qp, B_launch, M, Hq, D),
-                gl_view<bf16, Bshd>(kp, B_launch, N, Hkv, D),
-                gl_view<bf16, Bshd>(vp, B_launch, N, Hkv, Dv),
-                gl_view<bf16, Bshd>(op, B_launch, M, Hq, Dv),
-                make_gl<gl<float, -1, -1, -1, -1>>(
-                    reinterpret_cast<uint64_t>(Lse.data_ptr()) + (uint64_t)b * Hq * 1 * M * sizeof(float), B_launch, Hq,
-                    1, M),
-                at::cuda::getCurrentCUDAStream(),
-                8,
-                sc,
-            };
-            dispatch_micro<64, Bshd>(g);
-            const hipError_t err = hipGetLastError();
-            TORCH_CHECK(err == hipSuccess, "fmha_bf16_d64 launch: ", hipGetErrorString(err));
-        }
-    };
-    if (bshd)
-        launch(std::true_type{});
-    else
-        launch(std::false_type{});
-    if (return_lse)
-        return {O, Lse.reshape({B * Hq, M})};
-    return {O};
-}
-
-} // namespace fmha_bf16_d64

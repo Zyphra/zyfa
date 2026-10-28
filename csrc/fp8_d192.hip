@@ -1,13 +1,9 @@
-// HK GQA causal + XCD pair, fp8 fat 32x32x64, KN=64, streamed LDS K/V.
-// KV loop unrolled 8. QK at lgkmcnt(2); next-K under last PV aliases k_frag.
-// One bar per tile (after softmax, before PV). D=192 / Dv=128 / 8-wave / causal only.
-// RESCALE_SKIP: true (default) = HK Δmax≤8 delayed update. false = always rescale.
-#ifndef RESCALE_SKIP
-#define RESCALE_SKIP true
-#endif
-#include <ATen/cuda/CUDAContext.h>
+// FP8 (e4m3) causal forward attention for MLA, d_qk = 192 / d_v = 128: HIP kernel with 64-key tiles and exact P.
+// Also the fallback of fmha_fp8_d192_asm for tensors past the assembly kernel's 32-bit offsets.
+#include <ATen/hip/HIPContext.h>
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
+#include <c10/hip/HIPGuard.h>
 #include "rt_fp8_d192.h"
 #include "xcd_map.h"
 
@@ -43,51 +39,52 @@ __device__ __forceinline__ void rescale_o(o_tile &o, float corr) {
     o.d = mulsc(o.d, corr);
 }
 
+// Online softmax and PV of one 64-key tile: P = 2^(scale * s - mref + LEAN_SHIFT) on v_exp, RNE to e4m3 with a block
+// scale; l is summed by MFMA from the same rounded P as O.
 __device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase, float scale, float &m_, float &l_,
-                                          k_frag &kf, uint32_t k_next_off) {
-    const float mx = col_max2_sc(s, scale);
+                                          const i32x8 &sel, k_frag &kf, uint32_t k_next_off) {
+    const float lane_raw = xor32_max(lane_max2(s.a, s.b));
+    const float mx = lane_raw * scale;
     const float mnew = fmaxf(m_, mx);
-#if RESCALE_SKIP
     const float dmax = mnew - m_;
-    const int skip = __all(dmax <= RESCALE_THRESHOLD);
-    float corr = 1.f;
+    const int skip = __all(dmax <= LEAN_THR);
     float mref = m_;
     if (!__builtin_expect(skip, 1)) {
-        corr = (dmax > 0.f) ? zk_exp2(-dmax) : 1.f;
-        if (__builtin_expect(m_ != neg_inf(), 1))
+        const float corr = (dmax > 0.f) ? exp2_hw(-dmax) : 1.f;
+        if (__builtin_expect(m_ != neg_inf(), 1)) {
             rescale_o(o, corr);
+            l_ *= corr;
+        }
         mref = mnew;
         m_ = mnew;
     }
-#else
-    const float corr = (mnew > m_) ? zk_exp2(m_ - mnew) : 1.f;
-    if (__builtin_expect(m_ != neg_inf(), 1))
-        rescale_o(o, corr);
-    const float mref = mnew;
-    m_ = mnew;
-#endif
-    zk_iglp_smx();
-    hk8::exp2_sc(s.a, scale, mref);
-    hk8::exp2_sc(s.b, scale, mref);
-    l_ = l_ * corr + col_sum2(s);
+    const int off = block_off(lane_raw, scale, mref);
+    const int sb = 127 + off;
+    // LEAN_SHIFT - (mref + off); the asm keeps fast-math from reassociating it.
+    float mo = mref + (float)off;
+    asm volatile("" : "+v"(mo));
+    const float bx = LEAN_SHIFT - mo;
+    iglp_softmax();
+    p_exp_shifted(s.a, scale, bx);
+    p_exp_shifted(s.b, scale, bx);
     const i32x8 ps = pack_p(s.a, s.b);
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     wg_bar();
-    zk_setprio_hi();
-    mma_pv_lds_khead(o, vbase, ps, kf, k_next_off);
-    zk_setprio_lo();
+    __builtin_amdgcn_s_setprio(1);
+    mma_pv_lds_khead(o, vbase, ps, kf, k_next_off, sb);
+    l_ += block_rowsum(sel, ps, sb);
+    __builtin_amdgcn_s_setprio(0);
 }
 
 template <bool PairHeads, bool Bshd>
-__global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const unsigned char *Q, const unsigned char *K,
+__global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, const unsigned char *K,
                                                     const unsigned char *V, bf16 *O, float *Lse, int M, int N, int Hq,
                                                     int Hkv, float scale, int nxcd) {
     extern __shared__ Smem sm[];
     Smem &s = sm[0];
 
     constexpr int D = 192, Dv = 128;
-    // Keep stride in an SGPR for both instantiations so BHSD does not
-    // constant-fold D and take a different pack_p / QK schedule than BSHD.
+    // Strides stay in SGPRs in both layouts, so BHSD does not constant-fold them into a different schedule.
     int q_stride = Bshd ? Hq * D : D;
     int k_stride = Bshd ? Hkv * D : D;
     int v_stride = Bshd ? Hkv * Dv : Dv;
@@ -103,9 +100,7 @@ __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const unsigne
 
     int batch_idx, head_idx, head_kv, qwarp;
     if constexpr (PairHeads) {
-        // Eight physical waves become two barrier-synchronous 4-wave
-        // Q-head groups. The two heads share one KV head and identical
-        // q positions, so every K/V G->L transfer services both heads.
+        // Two 4-wave groups run two Q heads that share a KV head, so every K/V tile load serves both.
         const int pairs_per_kv = GROUP / 2;
         const int units_per_batch = Hkv * pairs_per_kv;
         batch_idx = hu / units_per_batch;
@@ -116,8 +111,6 @@ __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const unsigne
         qwarp = warpid() - head_slot * QW;
         head_idx = head_kv * GROUP + pair * 2 + head_slot;
     } else {
-        // Identity Q-head order keeps GROUP consecutive Q heads on one KV
-        // head so fmha_xcd_map locality extends across GQA.
         batch_idx = hu / Hq;
         head_idx = hu - batch_idx * Hq;
         head_kv = head_idx / GROUP;
@@ -159,8 +152,8 @@ __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const unsigne
         k_frag kf;
         zero_o(oR);
         load_q8(qT, Qh + (size_t)tile_idx * Q_BLOCK * q_stride, q_stride);
-        pin_q192(qT);
         float m_ = neg_inf(), l_ = 0.f;
+        const i32x8 sel = rowsum_sel();
 
         if (pp) {
             if constexpr (PairHeads)
@@ -175,8 +168,7 @@ __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const unsigne
         pin_kf(kf);
 
         auto one_tile = [&](int kb) {
-            // Required for BSHD vs BHSD bitwise match: without it pack_p
-            // takes a different schedule on the two instantiations.
+            // Also keeps the BSHD and BHSD instantiations on the same schedule (bitwise-equal results).
             asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
             wg_bar();
             const int cur = kb & 1, nx = cur ^ 1;
@@ -187,22 +179,21 @@ __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const unsigne
             const unsigned char *gVn = kv_tile_ptr(Vh, kb_n, v_stride);
             s2_tile att;
             const uint32_t k_next_off = k_off(lds_u32(s.k[nx].data), 0);
-            zk_iglp_qk();
+            iglp_qk();
             if (warpid() < 4)
-                zk_setprio_hi();
+                __builtin_amdgcn_s_setprio(1);
             else
-                zk_setprio_lo();
+                __builtin_amdgcn_s_setprio(0);
+            // QK, with the next tile's K/V prefetch between the MFMA pairs.
             prefetch_k_pass<0>(s.k[nx], gKn, k_stride);
             qk_step<false>(att, kf, qT.d0, k_off(kbase, 1));
             prefetch_k_pass<1>(s.k[nx], gKn, k_stride);
             qk_step<true>(att, kf, qT.d1, k_off(kbase, 2));
             prefetch_v(s.v[nx], gVn, v_stride);
-            qk_tail<true>(att, kf, qT.d2);
-            zk_qk_group_fp8_d192();
-            zk_split_region();
+            qk_tail(att, kf, qT.d2);
             if (__builtin_expect(q_start < (kb + 1) * KV_BLOCK, 0))
                 mask_s2(att, q_start, kb);
-            softmax_pv(oR, att, vbase, scale, m_, l_, kf, k_next_off);
+            softmax_pv(oR, att, vbase, scale, m_, l_, sel, kf, k_next_off);
         };
 
         int kb = 0;
@@ -216,9 +207,13 @@ __global__ void __launch_bounds__(NT, ZK_LAUNCH_BLOCKS) attend_ker(const unsigne
         for (; kb < max_num_tiles; ++kb)
             one_tile(kb);
 
-        store_o_fp8(Oh, q_start, M, oR, l_, o_stride);
+        drain_kf(kf);
+        mfma_rd_fence(oR);
+        // P and l carry 2^LEAN_SHIFT; their ratio does not.
+        const float m_lse = m_ - LEAN_SHIFT;
+        store_o_fp8_qrow(Oh, q_start, M, oR, l_, o_stride);
         if (Lh) {
-            const float lse = m_ * LN2 + logf(l_);
+            const float lse = m_lse * LN2 + logf(l_);
             store_lse(Lh, q_start, M, lse);
         }
     }
@@ -238,21 +233,20 @@ static void run(const unsigned char *Q, const unsigned char *K, const unsigned c
     const bool split = fmha_split_batch(B, nq_pairs, nheads, nxcd, M);
     const int batches = split ? B : 1;
     const int n_head_units = nheads * (split ? 1 : B);
+    // One workgroup per job (no persistent loop).
     const int grid = nq_pairs * n_head_units;
     const size_t q_batch = bshd ? (size_t)M * Hq * D : (size_t)Hq * M * D;
     const size_t k_batch = bshd ? (size_t)N * Hkv * D : (size_t)Hkv * N * D;
     const size_t v_batch = bshd ? (size_t)N * Hkv * Dv : (size_t)Hkv * N * Dv;
     const size_t o_batch = bshd ? (size_t)M * Hq * Dv : (size_t)Hq * M * Dv;
     if (pair_heads && bshd)
-        hipFuncSetAttribute((const void *)attend_ker<true, true>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+        hip_check(hipFuncSetAttribute((const void *)attend_ker<true, true>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536), "hipFuncSetAttribute");
     else if (pair_heads)
-        hipFuncSetAttribute((const void *)attend_ker<true, false>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+        hip_check(hipFuncSetAttribute((const void *)attend_ker<true, false>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536), "hipFuncSetAttribute");
     else if (bshd)
-        hipFuncSetAttribute((const void *)attend_ker<false, true>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
+        hip_check(hipFuncSetAttribute((const void *)attend_ker<false, true>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536), "hipFuncSetAttribute");
     else
-        hipFuncSetAttribute((const void *)attend_ker<false, false>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536);
-    // Split B only when one batch already fills the persist CU cap.
-    // Full grid (no persist loop): a job loop in attend_ker breaks pack_p bitwise.
+        hip_check(hipFuncSetAttribute((const void *)attend_ker<false, false>, hipFuncAttributeMaxDynamicSharedMemorySize, 65536), "hipFuncSetAttribute");
     for (int b = 0; b < batches; ++b) {
         const unsigned char *Qb = Q + b * q_batch;
         const unsigned char *Kb = K + b * k_batch;
@@ -271,10 +265,14 @@ static void run(const unsigned char *Q, const unsigned char *K, const unsigned c
 }
 
 std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, bool causal,
-                                              bool return_lse, bool bshd) {
+                                   bool return_lse, bool bshd) {
     TORCH_CHECK(causal, "fmha_fp8_d192 is causal-only");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
-    TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fn, "fmha_fp8_d192 needs float8_e4m3fn");
+    TORCH_CHECK(k.device() == q.device() && v.device() == q.device(), "q, k, v must be on the same device");
+    const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+    TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fn && k.scalar_type() == at::kFloat8_e4m3fn &&
+                    v.scalar_type() == at::kFloat8_e4m3fn,
+                "fmha_fp8_d192 needs float8_e4m3fn");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
                 bshd ? "q,k,v must be BSHD [B,S,H,D]" : "q,k,v must be BHSD [B,H,S,D]");
     q = q.contiguous();
@@ -288,7 +286,8 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     const int B = q.size(0);
     TORCH_CHECK(D == 192 && Dv == 128 && M % 256 == 0 && N % 64 == 0);
     TORCH_CHECK(M == N && scale > 0, "fmha_fp8_d192 needs M == N and scale > 0");
-    TORCH_CHECK(Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
+    TORCH_CHECK(fmha_scale_fp8_ok(scale), "fmha_fp8_d192 needs a positive normal fp32 scale");
+    TORCH_CHECK(Hkv > 0 && Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
     if (bshd) {
         TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);
     } else {
@@ -302,6 +301,8 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
         Lse = torch::empty({B * Hq, M}, q.options().dtype(at::kFloat));
         Lp = Lse.data_ptr<float>();
     }
+    if (B == 0 || Hq == 0 || M == 0)
+        return return_lse ? std::vector<torch::Tensor>{O, Lse} : std::vector<torch::Tensor>{O};
     run((const unsigned char *)q.data_ptr(), (const unsigned char *)k.data_ptr(),
         (const unsigned char *)v.data_ptr(), reinterpret_cast<bf16 *>(O.data_ptr()), Lp, M, N, B, Hq, Hkv,
         (float)scale * L2E, bshd, at::cuda::getCurrentCUDAStream());

@@ -1,0 +1,4 @@
+include README.md LICENSE
+recursive-include csrc *.hip *.h *.cuh *.cpp *.py
+recursive-include third_party *
+global-exclude *_hip.hip *_hip.h __pycache__ *.pyc

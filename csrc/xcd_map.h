@@ -1,13 +1,13 @@
 #pragma once
-// Local to the hip research family (not the production fmha tree).
-// Hardware round-robins flattened block IDs across XCDs (CTA i -> XCD i % nxcd),
-// each with a 4 MB L2. The default 2D grid (q-pair, head) is x-fast, so one XCD
-// sees many heads' K/V. Remap so each XCD walks consecutive Q-pairs of one head.
-// Bijection on (qx, bh). ZK_FMHA_NXCD overrides.
-#include <cstdlib>
+// Job-to-XCD mapping for the causal kernels, plus host helpers for the persistent grid and the scale checks.
+#include <cstdint>
+#include <c10/util/Exception.h>
+#include <cstring>
 #include <hip/hip_runtime.h>
 
-__device__ __forceinline__ void fmha_xcd_map(int nq_pairs, int BH, int nxcd, int &qx, int &bh, int i) {
+// Workgroup i runs on XCD i % nxcd (each XCD has its own L2). Remap i so each XCD walks consecutive Q-block pairs of
+// one head instead of every nxcd-th job; a bijection on (qx, bh).
+__host__ __device__ __forceinline__ void fmha_xcd_map(int nq_pairs, int BH, int nxcd, int &qx, int &bh, int i) {
     if (nxcd <= 1) {
         qx = i % nq_pairs;
         bh = i / nq_pairs;
@@ -28,27 +28,23 @@ __device__ __forceinline__ void fmha_xcd_map(int nq_pairs, int BH, int nxcd, int
     fmha_xcd_map(nq_pairs, BH, nxcd, qx, bh, (int)blockIdx.x);
 }
 
-__host__ inline int fmha_num_xcds() {
-    static int cached = -1;
-    if (cached >= 0)
-        return cached;
-    int n = 8;
-    if (const char *e = std::getenv("ZK_FMHA_NXCD")) {
-        const int v = std::atoi(e);
-        if (v > 0)
-            n = v;
-    } else {
-        int dev = 0, v = 0;
-        if (hipGetDevice(&dev) == hipSuccess &&
-            hipDeviceGetAttribute(&v, hipDeviceAttributeNumberOfXccs, dev) == hipSuccess && v > 0)
-            n = v;
-    }
-    cached = n;
-    return n;
+// XCD count of the current device (8 if the query fails).
+__host__ inline int fmha_device_xcds() {
+    int dev = 0, v = 0;
+    if (hipGetDevice(&dev) == hipSuccess &&
+        hipDeviceGetAttribute(&v, hipDeviceAttributeNumberOfXccs, dev) == hipSuccess && v > 0)
+        return v;
+    return 8;
 }
 
-// DeepSeek-style persistent grid: one WG per CU (multiple of nxcd so
-// grid-stride keeps block i on XCD i % nxcd). No atomics.
+// Same, queried once.
+__host__ inline int fmha_num_xcds() {
+    static int cached = -1;
+    if (cached < 0)
+        cached = fmha_device_xcds();
+    return cached;
+}
+
 __host__ inline int fmha_num_cus() {
     static int cached = -1;
     if (cached >= 0)
@@ -62,6 +58,7 @@ __host__ inline int fmha_num_cus() {
     return n;
 }
 
+// Persistent grid size: at most one workgroup per CU, a multiple of nxcd so a grid-stride job walk stays on one XCD.
 __host__ inline int fmha_persist_cap(int nxcd) {
     const int nxc = nxcd > 1 ? nxcd : 1;
     int cap = fmha_num_cus();
@@ -76,17 +73,30 @@ __host__ inline int fmha_persist_grid(int n_work, int nxcd) {
     return n_work < cap ? n_work : cap;
 }
 
-// Split B>1 into B=1 launches only when S is long AND one batch already
-// saturates the persist CU cap. Short S (M<8192) always fuses: WGs are
-// short-running and one B*heads launch beats four sequential B=1 launches.
-// Long S with a small grid (B=4 H=8 S=8K = 128 jobs) also stays fused.
-// ZK_FMHA_FUSE_B=1 forces a single fused grid.
+// Scale checks on the bit patterns: the extension builds with -ffast-math, which folds std::isfinite / isnan to true.
+__host__ inline uint64_t fmha_f64_bits(double x) {
+    uint64_t u;
+    std::memcpy(&u, &x, sizeof(u));
+    return u;
+}
+// |scale| * log2(e) is finite in fp32 (rejects inf and nan).
+__host__ inline bool fmha_scale_finite(double scale) {
+    return (fmha_f64_bits(scale) & 0x7fffffffffffffffull) < fmha_f64_bits(3.4028234663852886e38 / 1.4426950408889634);
+}
+// FP8: also positive and an fp32 normal (a denormal scale flushes to 0 in the kernel and masked -inf * 0 = NaN).
+__host__ inline bool fmha_scale_fp8_ok(double scale) {
+    const uint64_t u = fmha_f64_bits(scale);
+    return (u >> 63) == 0 && u >= fmha_f64_bits(1.1754943508222875e-38) && fmha_scale_finite(scale);
+}
+
+// Split B > 1 into B = 1 launches only at long S (M >= 8192) when one batch already fills the persistent grid.
 __host__ inline bool fmha_split_batch(int B, int nq_pairs, int nheads, int nxcd, int M) {
     if (B <= 1)
         return false;
     if (M < 8192)
         return false;
-    if (const char *e = std::getenv("ZK_FMHA_FUSE_B"); e && std::atoi(e) == 1)
-        return false;
     return nq_pairs * nheads >= fmha_persist_cap(nxcd);
 }
+
+// Throws on a failed HIP runtime call.
+inline void hip_check(hipError_t e, const char *what) { TORCH_CHECK(e == hipSuccess, what, ": ", hipGetErrorString(e)); }
