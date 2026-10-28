@@ -1,59 +1,185 @@
-import functools
+import glob
 import math
+import os
+from typing import Optional
 
 import torch
 
 try:
     from . import _C
 except ImportError as e:
+    if glob.glob(os.path.join(os.path.dirname(__file__), "_C*.so")):
+        raise ImportError(f"zyfa's extension failed to load ({e}); rebuild it against this PyTorch with "
+                          "`pip install . --no-build-isolation`") from e
     raise ImportError("zyfa's extension is not built: run `pip install . --no-build-isolation`, and import zyfa from "
                       "outside the source tree") from e
 
+FP8 = torch.float8_e4m3fn
 _KERNELS = {(torch.bfloat16, 128, 128): _C.bf16_d128, (torch.bfloat16, 192, 128): _C.bf16_d192,
-            (torch.float8_e4m3fn, 128, 128): _C.fp8_d128, (torch.float8_e4m3fn, 192, 128): _C.fp8_d192}
+            (FP8, 128, 128): _C.fp8_d128, (FP8, 192, 128): _C.fp8_d192}
+_ARCH_OK = set()
+
+
+def _lse_shape(q, bshd):
+    return (q.shape[0], q.shape[2], q.shape[1]) if bshd else tuple(q.shape[:3])
+
+
+@torch.library.custom_op("zyfa::fwd", mutates_args=())
+def _fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float, v_scale: float, return_lse: bool,
+         bshd: bool, q_descale: Optional[torch.Tensor], k_descale: Optional[torch.Tensor],
+         v_descale: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    fn = _KERNELS[(q.dtype, q.shape[-1], v.shape[-1])]
+    if q.dtype == FP8:
+        res = fn(q, k, v, scale, True, return_lse, bshd, v_scale, q_descale, k_descale, v_descale)
+    else:
+        res = fn(q, k, v, scale, True, return_lse, bshd)
+    lse = res[1].view(_lse_shape(q, bshd)) if return_lse else q.new_empty(0, dtype=torch.float32)
+    return res[0], lse
+
+
+@_fwd.register_fake
+def _(q, k, v, scale, v_scale, return_lse, bshd, q_descale, k_descale, v_descale):
+    out = q.new_empty((*q.shape[:-1], v.shape[-1]), dtype=torch.bfloat16)
+    return out, q.new_empty(_lse_shape(q, bshd) if return_lse else 0, dtype=torch.float32)
+
+
+@torch.library.custom_op("zyfa::no_backward", mutates_args=())
+def _no_backward(grad: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    raise NotImplementedError("zyfa is forward only: it has no backward pass")
+
+
+@_no_backward.register_fake
+def _(grad, like):
+    return torch.empty_like(like)
+
+
+def _setup_context(ctx, inputs, output):
+    ctx.save_for_backward(*inputs[:3])
+
+
+def _backward(ctx, dout, dlse):
+    # The gradients are ops that raise when they run (they take dout, so they stay in the backward graph), so
+    # torch.compile can trace a function whose backward is never called.
+    return (*(_no_backward(dout, x) for x in ctx.saved_tensors), None, None, None, None, None, None, None)
+
+
+_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 
 def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1), softcap=0.0,
                     alibi_slopes=None, deterministic=False, return_attn_probs=False, *, return_lse=False,
                     q_descale=None, k_descale=None, v_descale=None, layout="bshd"):
-    """Causal attention forward with the arguments of flash_attn.flash_attn_func.
+    """Causal attention forward with the arguments of flash_attn.flash_attn_func (flash-attn 2 order).
 
     q: (batch, seqlen, nheads, d_qk), k: (batch, seqlen, nheads_k, d_qk), v: (batch, seqlen, nheads_k, d_v),
-    or (batch, nheads, seqlen, d) with layout="bhsd". bf16 or float8_e4m3fn inputs, bf16 output.
-    FP8 descales are per tensor. Returns out, (out, lse) with return_lse, or (out, lse, None) with return_attn_probs.
+    or (batch, nheads, seqlen, d) with layout="bhsd". bf16 or float8_e4m3fn inputs, bf16 output. FP8 descales are
+    floats or float32 tensors with one value (or one value expanded to (batch, nheads_k)); tensor values are not
+    checked on the host and must be positive normal floats.
+    Returns out, (out, lse) with return_lse, or (out, lse, None) with return_attn_probs.
     """
-    if not causal:
-        raise NotImplementedError("zyfa is causal only, pass causal=True")
-    if dropout_p or tuple(window_size) != (-1, -1) or softcap or alibi_slopes is not None:
-        raise NotImplementedError("zyfa has no dropout, sliding window, softcap or ALiBi")
+    _check_args(dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes)
     if layout not in ("bshd", "bhsd"):
         raise ValueError(f"layout must be 'bshd' or 'bhsd', got {layout!r}")
     bshd = layout == "bshd"
     _check(q, k, v, bshd)
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
-    if q.dtype == torch.float8_e4m3fn:
-        scale *= _descale(q_descale) * _descale(k_descale)
+    v_scale = 1.0
+    if q.dtype == FP8:
+        hk = k.shape[2 if bshd else 1]
+        q_f, q_descale = _descale(q_descale, "q_descale", q, hk)
+        k_f, k_descale = _descale(k_descale, "k_descale", q, hk)
+        v_scale, v_descale = _descale(v_descale, "v_descale", q, hk)
+        scale *= q_f * k_f
     elif q_descale is not None or k_descale is not None or v_descale is not None:
         raise ValueError("descales apply to float8_e4m3fn inputs only")
-    fn = _KERNELS[(q.dtype, q.shape[-1], v.shape[-1])]
 
-    res = fn(q, k, v, scale, True, return_lse or return_attn_probs, bshd)
-    out = res[0]
-    if v_descale is not None:
-        out.mul_(_descale(v_descale))
-    if not (return_lse or return_attn_probs):
+    want_lse = return_lse or return_attn_probs
+    sdim = 1 if bshd else 2
+    s = q.shape[sdim]
+    if s == 0:
+        out = q.new_empty((*q.shape[:-1], v.shape[-1]), dtype=torch.bfloat16)
+        lse = q.new_empty(_lse_shape(q, bshd), dtype=torch.float32)
+    else:
+        pad = -s % 256   # zero keys past the last query are masked, so padding is exact
+        if pad:
+            q, k, v = (torch.cat([x, x.new_zeros((*x.shape[:sdim], pad, *x.shape[sdim + 1:]))], sdim)
+                       for x in (q, k, v))
+        out, lse = torch.ops.zyfa.fwd(q, k, v, scale, v_scale, want_lse, bshd, q_descale, k_descale, v_descale)
+        if pad:
+            out = out.narrow(sdim, 0, s).contiguous()
+            lse = lse.narrow(2, 0, s).contiguous() if want_lse else lse
+    if not want_lse:
         return out
-    batch, nheads, seqlen = (q.shape[0], q.shape[2], q.shape[1]) if bshd else q.shape[:3]
-    lse = res[1].view(batch, nheads, seqlen)
+    return (out, lse, None) if return_attn_probs else (out, lse)
+
+
+def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1),
+                              softcap=0.0, alibi_slopes=None, deterministic=False, return_attn_probs=False, *,
+                              return_lse=False, q_descale=None, k_descale=None, v_descale=None):
+    """qkv: (batch, seqlen, 3, nheads, d). Same as flash_attn_func on its three slices (they are copied)."""
+    q, k, v = qkv.unbind(2)
+    return flash_attn_func(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes,
+                           deterministic, return_attn_probs, return_lse=return_lse, q_descale=q_descale,
+                           k_descale=k_descale, v_descale=v_descale)
+
+
+def flash_attn_kvpacked_func(q, kv, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1),
+                             softcap=0.0, alibi_slopes=None, deterministic=False, return_attn_probs=False, *,
+                             return_lse=False, q_descale=None, k_descale=None, v_descale=None):
+    """kv: (batch, seqlen, 2, nheads_k, d). Same as flash_attn_func on q and the two slices (they are copied)."""
+    k, v = kv.unbind(2)
+    return flash_attn_func(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes,
+                           deterministic, return_attn_probs, return_lse=return_lse, q_descale=q_descale,
+                           k_descale=k_descale, v_descale=v_descale)
+
+
+def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p=0.0,
+                           softmax_scale=None, causal=False, window_size=(-1, -1), softcap=0.0, alibi_slopes=None,
+                           deterministic=False, return_attn_probs=False, block_table=None, *, return_lse=False,
+                           q_descale=None, k_descale=None, v_descale=None):
+    """Equal-length sequences only. q: (total, nheads, d_qk), k: (total, nheads_k, d_qk), v: (total, nheads_k, d_v).
+    The lengths are checked from the shapes (total == batch * max_seqlen), so cu_seqlens is never read back.
+    Returns out (total, nheads, d_v) and, when asked, lse (nheads, total)."""
+    if block_table is not None:
+        raise NotImplementedError("zyfa has no paged KV cache")
+    b = cu_seqlens_q.shape[0] - 1
+    if not (cu_seqlens_k.shape[0] == b + 1 and max_seqlen_q == max_seqlen_k and q.shape[0] == b * max_seqlen_q
+            and k.shape[0] == b * max_seqlen_k and v.shape[0] == k.shape[0]):
+        raise NotImplementedError("zyfa's varlen path needs sequences of equal length: total == batch * max_seqlen "
+                                  "for q and k, and max_seqlen_q == max_seqlen_k")
+    res = flash_attn_func(*(x.reshape(b, max_seqlen_q, *x.shape[1:]) for x in (q, k, v)), dropout_p, softmax_scale,
+                          causal, window_size, softcap, alibi_slopes, deterministic, return_attn_probs,
+                          return_lse=return_lse, q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
+    if not isinstance(res, tuple):
+        return res.reshape(q.shape[0], *res.shape[2:])
+    out = res[0].reshape(q.shape[0], *res[0].shape[2:])
+    lse = res[1].transpose(0, 1).reshape(res[1].shape[1], q.shape[0])
     return (out, lse, None) if return_attn_probs else (out, lse)
 
 
 def fp8_quantize(x):
-    """Per-tensor power-of-two scaling to float8_e4m3fn. Returns (x_fp8, descale), x ~= x_fp8 * descale."""
-    amax = x.abs().max().item()
-    descale = 2.0 ** math.ceil(math.log2(amax / 448.0)) if amax > 0 and math.isfinite(amax) else 1.0
-    return (x.float() / descale).to(torch.float8_e4m3fn), descale
+    """Per-tensor power-of-two scaling to float8_e4m3fn, on the GPU (no host sync).
+    Returns (x_fp8, descale) with descale a 0-d float32 tensor and x ~= x_fp8 * descale."""
+    amax = x.abs().amax().float()
+    ok = (amax > 0) & torch.isfinite(amax)
+    descale = torch.where(ok, torch.exp2(torch.ceil(torch.log2(amax / 448.0))), torch.ones_like(amax))
+    return (x.float() / descale).to(FP8), descale
+
+
+def _check_args(dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes):
+    if dropout_p is None or isinstance(softmax_scale, bool):
+        raise TypeError("these arguments look like flash-attn 3's order (q, k, v, softmax_scale, causal); zyfa uses "
+                        "flash-attn 2's (q, k, v, dropout_p, softmax_scale, causal): pass them by keyword")
+    if dropout_p:
+        raise NotImplementedError("zyfa has no dropout (if this is softmax_scale, pass it by keyword)")
+    if not causal:
+        raise NotImplementedError("zyfa is causal only, pass causal=True")
+    left, right = (-1 if w is None else w for w in window_size)
+    if left >= 0 or right not in (-1, 0):
+        raise NotImplementedError("zyfa has no sliding window")
+    if softcap or alibi_slopes is not None:
+        raise NotImplementedError("zyfa has no softcap or ALiBi")
 
 
 def _check(q, k, v, bshd):
@@ -61,10 +187,11 @@ def _check(q, k, v, bshd):
         raise ValueError(f"q, k, v must be 4-D, got {q.dim()}, {k.dim()}, {v.dim()} dims")
     if not (q.is_cuda and k.device == q.device and v.device == q.device):
         raise ValueError("q, k, v must be on the same GPU")
-    _check_arch(q.device.index if q.device.index is not None else torch.cuda.current_device())
+    if not torch.compiler.is_compiling():
+        _check_arch(q.device.index if q.device.index is not None else torch.cuda.current_device())
     if not (q.dtype == k.dtype == v.dtype):
         raise TypeError(f"q, k, v must have one dtype, got {q.dtype}, {k.dtype}, {v.dtype}")
-    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+    if q.dtype not in (torch.bfloat16, FP8):
         raise TypeError(f"zyfa takes bfloat16 or float8_e4m3fn, got {q.dtype}")
     if (q.dtype, q.shape[-1], v.shape[-1]) not in _KERNELS:
         raise ValueError(f"no kernel for {q.dtype} with (d_qk, d_v) = ({q.shape[-1]}, {v.shape[-1]}); supported: "
@@ -77,30 +204,32 @@ def _check(q, k, v, bshd):
     if not (q.shape[s] == k.shape[s] == v.shape[s]):
         raise NotImplementedError(f"zyfa needs seqlen_q == seqlen_k == seqlen_v, got {q.shape[s]}, {k.shape[s]}, "
                                   f"{v.shape[s]}")
-    if q.shape[s] % 256:
-        raise ValueError(f"seqlen must be a multiple of 256, got {q.shape[s]}")
-    if k.shape[h] != v.shape[h] or q.shape[h] % k.shape[h]:
+    if k.shape[h] == 0 or k.shape[h] != v.shape[h] or q.shape[h] % k.shape[h]:
         raise ValueError(f"nheads ({q.shape[h]}) must be a multiple of nheads_k ({k.shape[h]}), the same for k and v")
-    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
-        raise NotImplementedError("zyfa is forward only: run it under torch.no_grad() or with inputs that do not "
-                                  "require grad")
 
 
-@functools.lru_cache(maxsize=None)
 def _check_arch(device):
-    arch = torch.cuda.get_device_properties(device).gcnArchName
-    if not arch.startswith("gfx950"):
-        raise RuntimeError(f"zyfa's kernels are built for gfx950 (MI355X), this GPU is {arch}")
+    if device not in _ARCH_OK:
+        arch = torch.cuda.get_device_properties(device).gcnArchName
+        if not arch.startswith("gfx950"):
+            raise RuntimeError(f"zyfa's kernels are built for gfx950 (MI355X), this GPU is {arch}")
+        _ARCH_OK.add(device)
 
 
-def _descale(x):
+def _descale(x, name, q, hk):
+    """-> (factor applied on the host, tensor read by the kernel)."""
     if x is None:
-        return 1.0
+        return 1.0, None
     if isinstance(x, torch.Tensor):
-        if x.numel() != 1:
-            raise NotImplementedError("zyfa takes per-tensor FP8 descales only")
-        x = x.item()
+        if x.dtype != torch.float32 or x.device != q.device:
+            raise TypeError(f"{name} must be a float32 tensor on q's device")
+        expanded = x.dim() == 2 and tuple(x.shape) == (q.shape[0], hk) and all(
+            st == 0 for n, st in zip(x.shape, x.stride()) if n > 1)
+        if x.numel() != 1 and not expanded:
+            raise NotImplementedError(f"zyfa takes one {name} per tensor: pass a 1-element tensor, or one expanded to "
+                                      "(batch, nheads_k) with .expand()")
+        return 1.0, x
     x = float(x)
-    if not (x > 0 and math.isfinite(x)):
-        raise ValueError(f"FP8 descales must be positive and finite, got {x}")
-    return x
+    if not 1.1754943508222875e-38 <= x <= 3.4028234663852886e38:
+        raise ValueError(f"FP8 descales must be positive normal fp32 values, got {x}")
+    return x, None

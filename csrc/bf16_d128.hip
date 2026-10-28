@@ -1081,7 +1081,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     const int M = bshd ? q.size(1) : q.size(2);
     const int Hkv = bshd ? k.size(2) : k.size(1);
     const int N = bshd ? k.size(1) : k.size(2);
-    TORCH_CHECK(D == 128 && Dv == 128 && M % 256 == 0 && N % 64 == 0 && N >= 256);
+    TORCH_CHECK(D == 128 && Dv == 128 && M % 256 == 0 && N % 64 == 0 && (N >= 256 || N == 0));
     TORCH_CHECK(M == N, "fmha_bf16 needs equal query and key lengths, got M=", M, " N=", N);
     TORCH_CHECK(Hkv > 0 && Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
     if (bshd) {
