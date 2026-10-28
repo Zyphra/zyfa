@@ -2,9 +2,12 @@
 
 Flash attention for AMD Instinct MI355X, from the Zyphra Optimization Engine (ZOE).
 
-ZYFA is the attention kernel library in ZOE, the engine behind [Zyphra Cloud](https://cloud.zyphra.com). It is a causal
-forward FlashAttention for CDNA4 (gfx950) in BF16 and FP8. The BF16 kernels are HIP, and the FP8 kernels are
-hand-scheduled gfx950 assembly. On MI355X, ZYFA is 1.3-2.0x faster than AITER in FP8 and matches it in BF16.
+ZYFA is ZOE's attention kernel engine for MI355X. ZOE is the engine behind [Zyphra Cloud](https://cloud.zyphra.com)
+and spans other hardware too, including AMD MI300X and AWS Trainium2. ZYFA is a causal forward FlashAttention for
+CDNA4 (gfx950) in BF16 and FP8. The BF16 kernels are HIP, and the FP8 kernels are hand-scheduled gfx950 assembly.
+
+On MI355X, ZYFA's FP8 kernels are 1.3-1.9x faster than AITER's on random inputs and 1.16-1.76x on activations
+captured from real models. Its BF16 kernels match AITER.
 
 ## Performance
 
@@ -12,17 +15,19 @@ TF/s on one MI355X, batch 1, causal, multi-head. ZYFA / AITER (ratio):
 
 | config | S = 2K | S = 16K | S = 32K |
 |---|---|---|---|
-| BF16, d=128 | 998 / 949 (1.05x) | 1241 / 1202 (1.03x) | 1264 / 1235 (1.02x) |
-| BF16, d_qk=192, d_v=128 | 1017 / 934 (1.09x) | 1291 / 1283 (1.01x) | 1330 / 1330 (1.00x) |
-| FP8, d=128 | 1890 / 1340 (1.41x) | 2597 / 1930 (1.35x) | 2671 / 1942 (1.38x) |
-| FP8, d_qk=192, d_v=128 | 1857 / 995 (1.87x) | 2384 / 1260 (1.89x) | 2465 / 1235 (2.00x) |
+| BF16, d=128 | 983 / 941 (1.04x) | 1233 / 1200 (1.03x) | 1250 / 1219 (1.03x) |
+| BF16, d_qk=192, d_v=128 | 959 / 917 (1.05x) | 1290 / 1288 (1.00x) | 1311 / 1316 (1.00x) |
+| FP8, d=128 | 1804 / 1313 (1.37x) | 2549 / 1882 (1.35x) | 2601 / 1937 (1.34x) |
+| FP8, d_qk=192, d_v=128 | 1707 / 930 (1.83x) | 2338 / 1232 (1.90x) | 2375 / 1224 (1.94x) |
 
-With grouped-query attention (4 query heads per KV head), FP8 d=128 is 1.27-1.44x AITER and BF16 is 1.00-1.07x.
+With grouped-query attention (4 query heads per KV head), FP8 d=128 is 1.27-1.37x AITER and BF16 d=128 is
+1.02-1.05x.
 
-Setup: kernel-only time (500 warm-up launches, then the mean of 100), heads = max(32, 262144 / S),
-q, k, v ~ N(0, 0.1²), TF/s = B·H·S²·(d_qk + d_v) / time. AITER 0.1.19 with its default kernel for each config:
-assembly at d=128, OPUS for BF16 d_qk=192, Composable Kernel for FP8 d_qk=192. FP8 runs take per-tensor scales; ZYFA's
-time leaves out the `v_descale` multiply (see Usage). ROCm 7.2.3, PyTorch 2.12.
+Setup: `benchmarks/benchmark.py` on one GPU, Oct 28, 2026. Time is the GPU time of every kernel a call launches, the
+mean of 100 calls after 500 warm-up calls, with 5 s idle before each S >= 16K. Heads = max(32, 262144 / S),
+q, k, v ~ N(0, 0.1²), TF/s = B·H·S²·(d_qk + d_v) / time. FP8 calls pass all three descales as GPU tensors. AITER
+0.1.19 with its default kernel for each config: assembly at d=128, OPUS for BF16 d_qk=192, Composable Kernel for FP8
+d_qk=192. ROCm 7.2.3, PyTorch 2.12. Runs on other GPUs of the same node differ by a few percent.
 
 N(0, 0.1²) inputs give near-uniform attention. On q, k, v captured from real models at S = 16K, with sustained clocks,
 FP8 d=128 is 1.16x (Mistral-7B-v0.3) and 1.17x (Qwen3-8B) AITER, FP8 d_qk=192 is 1.76x (DeepSeek-V2-Lite) and BF16 is
@@ -38,7 +43,7 @@ cd zyfa
 pip install . --no-build-isolation
 ```
 
-The build imports PyTorch, so keep `--no-build-isolation`.
+The build compiles against the PyTorch you already have, so keep `--no-build-isolation`.
 
 ## Usage
 
@@ -62,25 +67,37 @@ out = flash_attn_func(q8, k8, v8, causal=True, q_descale=q_s, k_descale=k_s, v_d
 
 - `layout="bhsd"` takes (batch, heads, seqlen, head_dim) tensors.
 - `return_lse=True` also returns the log-sum-exp, shape (batch, heads, seqlen).
-- `q_descale` and `k_descale` fold into the softmax scale. `v_descale` is applied to the output after the kernel, as
-  one elementwise multiply (+2% of the time at S = 32K, more at short S). To skip it, leave it out and fold the scale
-  into the output projection.
-- Pass descales as Python floats. Tensors work, but cost a device sync per call.
+- FP8 descales are per tensor: a float, a float32 GPU tensor with one value, or one value expanded to
+  (batch, nheads_k), the shape flash-attn 3 takes. The kernel reads tensor descales from GPU memory and applies all
+  three itself, so a call never waits on the host. Checking a tensor's value would need that wait, so it must hold a
+  positive normal float32. `fp8_quantize` returns its descale as a GPU tensor.
+- `flash_attn_qkvpacked_func`, `flash_attn_kvpacked_func` and `flash_attn_varlen_func` take the same arguments as
+  flash-attn's. The varlen one needs sequences of equal length.
+- Any sequence length works. Lengths that are not a multiple of 256 are zero-padded up to one, which is exact for
+  causal attention but copies q, k and v.
+- The kernels are registered as `torch.ops.zyfa.fwd`, so `torch.compile` traces through them, and calls can be
+  captured in CUDA graphs. Run each new FP8 shape once before capturing: its first call builds a job table on the host.
+
+## Differences from flash-attn
+
+- Causal only: pass `causal=True`. `window_size` (-1, 0) and (None, None) mean the same mask and are accepted.
+- Arguments follow flash-attn 2's order (q, k, v, dropout_p, softmax_scale, causal, ...). A positional call in
+  flash-attn 3's order (q, k, v, softmax_scale, causal) raises a TypeError: pass those by keyword.
+- `return_attn_probs=True` returns (out, lse, None). flash-attn 2 returns an empty tensor in the last place, and
+  flash-attn 3 returns (out, lse), which is what `return_lse=True` gives here.
+- FP8 descales cannot differ per head.
+- No backward. Inputs that require grad run forward, eagerly or under `torch.compile`, and backward raises.
+- Non-contiguous inputs, including the slices of packed qkv and kv, are copied before the kernel runs.
+- Not supported: KV cache and decode, paged KV, sequences of unequal length, dropout, softcap, ALiBi, sliding
+  windows, FP16.
 
 ## What is supported
 
 - MI355X (gfx950).
-- Forward, causal self-attention: seqlen_q == seqlen_k, a multiple of 256.
+- Forward, causal self-attention with seqlen_q == seqlen_k.
 - Head dims 128, and d_qk=192 with d_v=128 (MLA), in BF16 and in FP8 (e4m3).
 - MHA, GQA and MQA; batched sequences of equal length.
-- Per-tensor FP8 scales and BF16 output.
-- Bitwise-identical output from run to run.
-
-Not supported: backward, non-causal masks, variable-length batches, KV cache and decode, sliding windows, dropout,
-softcap, ALiBi, FP16.
-
-Under CUDA graphs, run each new FP8 shape once before capturing (the first call builds a job table on the host).
-ZYFA is not registered as a `torch.library` op, so `torch.compile` breaks the graph around it.
+- BF16 output, bitwise identical from run to run.
 
 ## Accuracy
 
@@ -104,18 +121,20 @@ exact value by up to a few hundredths.
   layouts.
 - Causal query tiles are paired, first with last, so jobs carry equal work. A persistent grid assigns jobs to the 8
   chiplets (XCDs).
-- Tensors with offsets past 32 bits run a HIP version of the FP8 kernel with the same arithmetic.
+- Tensors with offsets past 32 bits run a HIP version of the FP8 kernel with the same output (the LSE can differ by a
+  few millionths).
 - Every conversion rounds to nearest even.
 
 ## Tests and benchmarks
 
 ```sh
-pytest tests
+python -m pytest tests
 python benchmarks/benchmark.py --dtype fp8 --dims 128
 ```
 
-The tests compare against fp64 attention. The benchmark compares against AITER when it is installed. After editing
-anything under `csrc/`, delete `build/` before rebuilding: the build does not track headers or the assembly generators.
+The tests compare against fp64 attention. The benchmark uses the protocol of the table above and compares against
+AITER when it is installed. After editing anything under `csrc/`, delete `build/` before rebuilding: the build does
+not track headers or the assembly generators.
 
 ## License
 
