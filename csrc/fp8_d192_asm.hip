@@ -12,32 +12,36 @@
 #include <tuple>
 #include <vector>
 
+#include "descale.h"
 #include "generated/fmha_fp8_d192_pp_co.h"
 #include "xcd_map.h"
 
 namespace fmha_fp8_d192 {   // HIP kernel (fp8_d192.hip)
 std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, bool causal,
-                                   bool return_lse, bool bshd);
+                                   bool return_lse, bool bshd, double v_scale, const float *q_descale,
+                                   const float *k_descale, const float *v_descale);
 }
 
 namespace fmha_fp8_d192_asm {
 
-// Kernel argument block (dword offsets match d192.KA); the kernel does not read c8, b8k or pad.
+// Kernel argument block (dword offsets match d192.KA). The kernel multiplies sl2 by q_descale * k_descale and the
+// output by v_descale * v_scale; a null descale pointer reads as 1.
 struct alignas(8) Args {
     const void *q, *k, *v;
     void *o, *lse;
     const void *tab;
     float sl2;
     uint32_t n_jobs, num_q, qw, pair, q_ss, k_ss, v_ss, o_ss, q_sh2, o_sh2, l_sh2, n_keys, grid;
-    float c8, b8k;
-    uint32_t pad[4];
+    float v_scale;
+    uint32_t pad[5];
+    const float *q_descale, *k_descale, *v_descale;
 };
-static_assert(sizeof(Args) == 128, "kernarg block is 128 bytes");
-static_assert(offsetof(Args, sl2) == 48 && offsetof(Args, grid) == 100 && offsetof(Args, c8) == 104,
+static_assert(sizeof(Args) == 152, "kernarg block is 152 bytes");
+static_assert(offsetof(Args, sl2) == 48 && offsetof(Args, grid) == 100 && offsetof(Args, v_scale) == 104 &&
+                  offsetof(Args, q_descale) == 128 && offsetof(Args, v_descale) == 144,
               "kernarg layout");
 
 constexpr float L2E = 1.4426950408889634f;
-constexpr float LEAN_BIAS = 0.35f;
 
 // Per-shape launch plan: grid, strides and the job table (one entry per job: q pair index, LSE row offset, Q and K
 // byte offsets (64-bit), V offset / 128, O offset / 256), built on the host with the HIP kernels' job order.
@@ -135,7 +139,9 @@ static const Plan &plan(int dev, int B, int Hq, int Hkv, int M, bool bshd) {
 }
 
 std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, bool causal,
-                                   bool return_lse, bool bshd) {
+                                   bool return_lse, bool bshd, double v_scale,
+                                   c10::optional<torch::Tensor> q_descale, c10::optional<torch::Tensor> k_descale,
+                                   c10::optional<torch::Tensor> v_descale) {
     TORCH_CHECK(causal, "fmha_fp8 is causal-only");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device(), "q, k, v must be on the same device");
@@ -157,6 +163,9 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     TORCH_CHECK(D == 192 && Dv == 128 && M % 256 == 0 && N % 64 == 0);
     TORCH_CHECK(M == N && scale > 0, "fmha_fp8 needs M == N and scale > 0");
     TORCH_CHECK(fmha_scale_fp8_ok(scale), "fmha_fp8 needs a positive normal fp32 scale");
+    fmha_check_v_scale(v_scale);
+    const float *qd = fmha_descale_ptr(q_descale, q, "q_descale"), *kd = fmha_descale_ptr(k_descale, q, "k_descale"),
+                *vd = fmha_descale_ptr(v_descale, q, "v_descale");
     TORCH_CHECK(Hkv > 0 && Hq % Hkv == 0 && k.size(3) == D && q.size(0) == k.size(0) && q.size(0) == v.size(0));
     if (bshd) {
         TORCH_CHECK(v.size(1) == N && v.size(2) == Hkv);
@@ -171,7 +180,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
                                   (uint64_t)B * Hq * M * 4};
         for (uint64_t x : spans)
             if (x >= lim)
-                return fmha_fp8_d192::forward(q, k, v, scale, causal, return_lse, bshd);
+                return fmha_fp8_d192::forward(q, k, v, scale, causal, return_lse, bshd, v_scale, qd, kd, vd);
     }
     auto O = bshd ? torch::empty({B, M, Hq, Dv}, q.options().dtype(at::kBFloat16))
                   : torch::empty({B, Hq, M, Dv}, q.options().dtype(at::kBFloat16));
@@ -212,8 +221,10 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
     a.l_sh2 = M;
     a.n_keys = N;
     a.grid = p->grid;
-    a.c8 = 8.f * sl2;
-    a.b8k = 8.f * 6.f + 56.f - LEAN_BIAS;
+    a.v_scale = (float)v_scale;
+    a.q_descale = qd;
+    a.k_descale = kd;
+    a.v_descale = vd;
     size_t sz = sizeof(a);
     void *extra[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &a, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     hipStream_t stream = at::cuda::getCurrentCUDAStream();

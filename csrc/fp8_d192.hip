@@ -79,8 +79,16 @@ __device__ __forceinline__ void softmax_pv(o_tile &o, s2_tile &s, uint32_t vbase
 template <bool PairHeads, bool Bshd>
 __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, const unsigned char *K,
                                                     const unsigned char *V, bf16 *O, float *Lse, int M, int N, int Hq,
-                                                    int Hkv, float scale, int nxcd) {
+                                                    int Hkv, float scale, int nxcd, const float *qd, const float *kd,
+                                                    const float *vd, float v_scale) {
     extern __shared__ Smem sm[];
+    // Descales from device memory (null reads as 1), in the assembly kernel's order (the fences stop fast-math
+    // from reassociating it).
+    float qk = (qd ? *qd : 1.f) * (kd ? *kd : 1.f);
+    asm volatile("" : "+v"(qk));
+    scale *= qk;
+    float ov = (vd ? *vd : 1.f) * v_scale;
+    asm volatile("" : "+v"(ov));
     Smem &s = sm[0];
 
     constexpr int D = 192, Dv = 128;
@@ -211,7 +219,7 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
         mfma_rd_fence(oR);
         // P and l carry 2^LEAN_SHIFT; their ratio does not.
         const float m_lse = m_ - LEAN_SHIFT;
-        store_o_fp8_qrow(Oh, q_start, M, oR, l_, o_stride);
+        store_o_fp8_qrow(Oh, q_start, M, oR, l_, ov, o_stride);
         if (Lh) {
             const float lse = m_lse * LN2 + logf(l_);
             store_lse(Lh, q_start, M, lse);
@@ -220,7 +228,8 @@ __global__ void __launch_bounds__(NT, 1) attend_ker(const unsigned char *Q, cons
 }
 
 static void run(const unsigned char *Q, const unsigned char *K, const unsigned char *V, bf16 *O, float *Lse, int M,
-                int N, int B, int Hq, int Hkv, float scale, bool bshd, hipStream_t stream) {
+                int N, int B, int Hq, int Hkv, float scale, bool bshd, const float *qd, const float *kd,
+                const float *vd, float v_scale, hipStream_t stream) {
     const int GROUP = Hq / Hkv;
     const bool pair_heads = GROUP >= 2 && (GROUP & 1) == 0;
     const int q_waves = pair_heads ? (NW / 2) : NW;
@@ -254,18 +263,23 @@ static void run(const unsigned char *Q, const unsigned char *K, const unsigned c
         bf16 *Ob = O + b * o_batch;
         float *Lb = Lse ? Lse + (size_t)b * Hq * M : nullptr;
         if (pair_heads && bshd)
-            attend_ker<true, true><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+            attend_ker<true, true><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd, qd, kd,
+                                                               vd, v_scale);
         else if (pair_heads)
-            attend_ker<true, false><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+            attend_ker<true, false><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd, qd, kd,
+                                                                vd, v_scale);
         else if (bshd)
-            attend_ker<false, true><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+            attend_ker<false, true><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd, qd, kd,
+                                                                vd, v_scale);
         else
-            attend_ker<false, false><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd);
+            attend_ker<false, false><<<grid, NT, smem, stream>>>(Qb, Kb, Vb, Ob, Lb, M, N, Hq, Hkv, scale, nxcd, qd,
+                                                                 kd, vd, v_scale);
     }
 }
 
 std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, bool causal,
-                                   bool return_lse, bool bshd) {
+                                   bool return_lse, bool bshd, double v_scale, const float *qd, const float *kd,
+                                   const float *vd) {
     TORCH_CHECK(causal, "fmha_fp8_d192 is causal-only");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device(), "q, k, v must be on the same device");
@@ -305,7 +319,7 @@ std::vector<torch::Tensor> forward(torch::Tensor q, torch::Tensor k, torch::Tens
         return return_lse ? std::vector<torch::Tensor>{O, Lse} : std::vector<torch::Tensor>{O};
     run((const unsigned char *)q.data_ptr(), (const unsigned char *)k.data_ptr(),
         (const unsigned char *)v.data_ptr(), reinterpret_cast<bf16 *>(O.data_ptr()), Lp, M, N, B, Hq, Hkv,
-        (float)scale * L2E, bshd, at::cuda::getCurrentCUDAStream());
+        (float)scale * L2E, bshd, qd, kd, vd, (float)v_scale, at::cuda::getCurrentCUDAStream());
     if (return_lse)
         return {O, Lse};
     return {O};

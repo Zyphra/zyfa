@@ -6,8 +6,9 @@ import re
 import struct
 import sys
 
-KARG_BYTES = 128
-NSGPR = 96
+KARG_BYTES = 152
+NSGPR = 102
+S_QD, S_KD, S_VD = 96, 98, 100   # q/k/v descale pointers (kernarg bytes 128-151), then each value in the low dword
 RESCALE_THR = 0.125   # O and l are rescaled only when the row max (log2 units) grows by more than this
 
 
@@ -295,9 +296,41 @@ class KernelBase:
         self.g.emit("s_barrier")
         self.g.reset_hazards()
 
+    # ------------------------------------------------------------ FP8 descales (float32 in device memory)
+    def descale_ptrs(self):
+        """Issued with the kernarg loads."""
+        self.g.emit(f"s_load_dwordx4 {ss(S_QD, 4)}, s[0:1], 128")
+        self.g.emit(f"s_load_dwordx2 {ss(S_VD, 2)}, s[0:1], 144")
+
+    def descale_values(self):
+        """Once the pointers are in: load each value into its pointer's low dword. A null pointer reads as 1."""
+        g = self.g
+        for r in (S_QD, S_KD, S_VD):
+            l_null, l_done = self.L("dnull"), self.L("ddone")
+            g.emit(f"s_cmp_eq_u64 {ss(r, 2)}, 0")
+            g.emit(f"s_cbranch_scc1 {l_null}")
+            g.emit(f"s_load_dword {s(r)}, {ss(r, 2)}, 0")
+            g.emit(f"s_branch {l_done}")
+            g.label(l_null)
+            g.emit(f"s_mov_b32 {s(r)}, 1.0")
+            g.label(l_done)
+
+    def descale_fold(self, consts, v_scale, t0, t1):
+        """Once the values are in (first job): each scale constant *= q_descale * k_descale, and S_VD = v_descale *
+        v_scale, the factor the epilogue applies with 1/l. Factors of 1 leave every bit unchanged."""
+        g = self.g
+        g.emit(f"v_mov_b32 {v(t0)}, {s(S_QD)}")
+        g.emit(f"v_mul_f32 {v(t0)}, {s(S_KD)}, {v(t0)}")
+        for c in consts:
+            g.emit(f"v_mul_f32 {v(t1)}, {c}, {v(t0)}")
+            g.emit(f"v_readfirstlane_b32 {c}, {v(t1)}")
+        g.emit(f"v_mov_b32 {v(t0)}, {s(S_VD)}")
+        g.emit(f"v_mul_f32 {v(t0)}, {v_scale}, {v(t0)}")
+        g.emit(f"v_readfirstlane_b32 {s(S_VD)}, {v(t0)}")
+
 
 def kernel_text(name, body, lds_bytes):
-    """Assembly file: the kernel body plus its descriptor and metadata (512 threads, 256 VGPRs, 128 B kernarg)."""
+    """Assembly file: the kernel body plus its descriptor and metadata (512 threads, 256 VGPRs, 152 B kernarg)."""
     return f""".amdgcn_target "amdgcn-amd-amdhsa--gfx950"
 .text
 .globl {name}

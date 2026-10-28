@@ -430,9 +430,10 @@ __device__ __forceinline__ i32x8 pack_p(const fx16 &lo, const fx16 &hi) {
 }
 
 // O / l to bf16 (A = V, B = P: the query stays in the lane, as in the BF16 store).
-__device__ __forceinline__ void store_o_fp8_qrow(bf16 *O, int q_base, int M, const o_tile &o, float l_,
+__device__ __forceinline__ void store_o_fp8_qrow(bf16 *O, int q_base, int M, const o_tile &o, float l_, float ov,
                                                 int seq_stride = Dv) {
-    const float inv = (l_ > 0.f) ? __builtin_amdgcn_rcpf(l_) : 0.f;
+    float inv = (l_ > 0.f) ? __builtin_amdgcn_rcpf(l_) * ov : 0.f;
+    asm volatile("" : "+v"(inv));   // 1/l * ov first, as the assembly kernels do
     o_tile t;
     t.a = mulsc(o.a, inv);
     t.b = mulsc(o.b, inv);

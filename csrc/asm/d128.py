@@ -2,7 +2,7 @@
 """Generates the FP8 causal forward attention kernel for d_qk = d_v = 128 on gfx950 (`fmha_fp8pp`) as hand-scheduled
 assembly. Eight waves in two groups run one phase apart, so on each SIMD one wave issues the MFMAs (QK, PV) while the
 other computes the softmax statistics and the e4m3 codes of P. 128-key K and V tiles go through 4-slot LDS rings."""
-from common import KernelBase, LdsQ, kernel_text, main, rescale_vote, s, ss, v, vv
+from common import S_VD, KernelBase, LdsQ, kernel_text, main, rescale_vote, s, ss, v, vv
 
 # ---------------------------------------------------------------- registers
 O = [0, 16, 32, 48]            # O^T accumulators (fp32, d_v rows x 32 queries)
@@ -56,7 +56,7 @@ S_EOH, S_ELSE = 92, 94         # s[92:93], s[94:95]: O / LSE bases of the pass b
 
 # kernarg layout (dwords from S_A)
 KA = dict(Q=0, K=2, V=4, O=6, LSE=8, TAB=10, C8=12, SL2=13, B8K=14, NJOBS=15, NUMQ=16, QW=17, PAIR=18, Q_SS=19,
-          KV_SS=20, O_SS=21, Q_SH2=22, O_SH2=23, L_SH2=24, NKEYS=25, GRID=26)
+          KV_SS=20, O_SS=21, Q_SH2=22, O_SH2=23, L_SH2=24, NKEYS=25, GRID=26, V_SCALE=27)
 
 LDS_K = [0, 16384, 32768, 49152]   # K ring slots
 LDS_V0 = 65536                     # V ring: 4 slots of 16 KB
@@ -84,6 +84,7 @@ class Kernel(KernelBase):
         g = self.g
         g.emit(f"s_load_dwordx16 {ss(S_A, 16)}, {ss(S_KARG, 2)}, 0")
         g.emit(f"s_load_dwordx16 {ss(S_A + 16, 16)}, {ss(S_KARG, 2)}, 64")
+        self.descale_ptrs()
         g.emit(f"v_mov_b32 {v(V_TID)}, v0")
         g.emit(f"v_lshrrev_b32 {v(V_TMP)}, 6, {v(V_TID)}")
         g.emit(f"v_readfirstlane_b32 {s(S_W)}, {v(V_TMP)}")
@@ -116,6 +117,7 @@ class Kernel(KernelBase):
         g.emit(f"v_and_b32 {v(V_TMP)}, 15, {v(V_T1)}")
         g.emit(f"v_lshl_add_u32 {v(V_VL)}, {v(V_TMP)}, 3, {v(V_VL)}")
         g.emit("s_waitcnt lgkmcnt(0)")
+        self.descale_values()
         g.emit(f"v_mov_b32 {v(V_127)}, 0x7f")
         g.emit(f"v_mov_b32 {v(V_NINF)}, 0xff800000")
         g.emit(f"v_mov_b32 {v(V_M8)}, 0xc1000000")
@@ -634,6 +636,7 @@ class Kernel(KernelBase):
         g.emit(f"v_rcp_f32 {v(V_TMP)}, {v(V_L)}")
         g.emit(f"v_log_f32 {v(V_LSE)}, {v(V_L)}")
         g.nop(2)
+        g.emit(f"v_mul_f32 {v(V_TMP)}, {s(S_VD)}, {v(V_TMP)}")   # v_descale
         for j in range(4):
             for r in range(16):
                 g.emit(f"v_mul_f32 {v(O[j] + r)}, {v(V_TMP)}, {v(O[j] + r)}")
@@ -709,6 +712,7 @@ class Kernel(KernelBase):
         g.emit(f"s_cmp_ge_u32 {s(S_JOB)}, {arg('NJOBS')}")
         g.emit(f"s_cbranch_scc1 {l_end}")
         self.load_job()
+        self.descale_fold([arg("C8"), arg("SL2")], arg("V_SCALE"), V_T0, V_T1)
         self.pass_params()
         self.q_load()
         # first pass: every wave loads its share of K0, V0, K1 (ring slots 0, 0, 1)
