@@ -2,8 +2,7 @@
 
 Flash attention for AMD Instinct MI355X, from the Zyphra Optimization Engine (ZOE).
 
-ZYFA is ZOE's attention kernel engine for MI355X. ZOE is the engine behind [Zyphra Cloud](https://cloud.zyphra.com)
-and spans other hardware too, including AMD MI300X and AWS Trainium2. ZYFA is a causal forward FlashAttention for
+ZYFA is ZOE's attention kernel engine for MI355X. ZOE is the engine behind [Zyphra Cloud](https://cloud.zyphra.com). ZYFA is a causal forward FlashAttention for
 CDNA4 (gfx950) in BF16 and FP8. The BF16 kernels are HIP, and the FP8 kernels are hand-scheduled gfx950 assembly.
 
 On MI355X, ZYFA's FP8 kernels are 1.3-1.9x faster than AITER's on random inputs and 1.16-1.76x on activations
