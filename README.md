@@ -146,7 +146,10 @@ S = 16K, median of three runs. After 2 s of idle time each kernel runs back to b
 #### Why captured activations differ
 
 Under sustained load the MI355X lowers its clock, and it lowers it further the more the values in its arithmetic units
-change from one instruction to the next. Gaussian inputs with standard deviation 0.1 make attention nearly uniform,
+change from one instruction to the next. Horace He showed the same effect for matrix multiplications on NVIDIA GPUs,
+where inputs whose bits change less draw less power and therefore run at a higher clock
+([Strangely, Matrix Multiplications on GPUs Run Faster When Given "Predictable" Data!](https://www.thonking.ai/p/strangely-matrix-multiplications)).
+Gaussian inputs with standard deviation 0.1 make attention nearly uniform,
 so every probability is close to the row maximum and every kernel writes normal FP8 values. In real activations most
 probabilities lie far below the row maximum. In the Mistral-7B layer, for 91% of the pairs of a row and a 64-key
 block, the largest probability of the block lies more than 8 binades (a factor of 256) below the row maximum. AITER's
