@@ -1,3 +1,8 @@
+"""Python interface to the ZYFA kernels, with the arguments of flash-attn's functions.
+
+The kernels are registered as the custom operator ``torch.ops.zyfa.fwd``, so ``torch.compile`` traces through them and
+calls can be captured in CUDA graphs.
+"""
 import glob
 import math
 import os
@@ -69,13 +74,34 @@ _fwd.register_autograd(_backward, setup_context=_setup_context)
 def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1), softcap=0.0,
                     alibi_slopes=None, deterministic=False, return_attn_probs=False, *, return_lse=False,
                     q_descale=None, k_descale=None, v_descale=None, layout="bshd"):
-    """Causal attention forward with the arguments of flash_attn.flash_attn_func (flash-attn 2 order).
+    """Causal attention forward pass with the arguments of ``flash_attn.flash_attn_func`` (flash-attn 2 order).
 
-    q: (batch, seqlen, nheads, d_qk), k: (batch, seqlen, nheads_k, d_qk), v: (batch, seqlen, nheads_k, d_v),
-    or (batch, nheads, seqlen, d) with layout="bhsd". bf16 or float8_e4m3fn inputs, bf16 output. FP8 descales are
-    floats or float32 tensors with one value (or one value expanded to (batch, nheads_k)); tensor values are not
-    checked on the host and must be positive normal floats.
-    Returns out, (out, lse) with return_lse, or (out, lse, None) with return_attn_probs.
+    Args:
+        q: (batch, seqlen, nheads, d_qk), or (batch, nheads, seqlen, d_qk) with ``layout="bhsd"``.
+        k: (batch, seqlen, nheads_k, d_qk). nheads must be a multiple of nheads_k (MHA, GQA, or MQA).
+        v: (batch, seqlen, nheads_k, d_v). (d_qk, d_v) is (128, 128) or (192, 128), and q, k, and v are all
+            bfloat16 or all float8_e4m3fn. Any seqlen works, and lengths that are not a multiple of 256 are padded
+            with zeros, which copies q, k, and v.
+        dropout_p: must be 0.
+        softmax_scale: scale applied to q k^T before the softmax. Defaults to 1 / sqrt(d_qk).
+        causal: must be True.
+        window_size: (-1, -1), (-1, 0), or (None, None), which all give the causal mask.
+        softcap, alibi_slopes: not supported, so they must keep their defaults.
+        deterministic: accepted for compatibility. The output is always bitwise identical from run to run.
+        return_attn_probs: also return the log-sum-exp, as (out, lse, None) like flash-attn 2.
+        return_lse: also return the log-sum-exp, as (out, lse) like flash-attn 3.
+        q_descale, k_descale, v_descale: FP8 only. Per-tensor factors that map the FP8 values back to their
+            original range, as returned by ``fp8_quantize``. Each one is a float, a float32 tensor with one element
+            on q's device, or such a tensor expanded to (batch, nheads_k), the shape that flash-attn 3 takes. The
+            kernel reads tensor descales on the GPU and does not check their values, so they must be positive
+            normal float32 values.
+        layout: "bshd" (the default) or "bhsd".
+
+    Returns:
+        out: bfloat16, with the shape of q and d_v as its last dimension.
+        lse: float32 (batch, nheads, seqlen), the natural-log log-sum-exp of each row of scaled scores, returned only
+            with return_lse or return_attn_probs. In FP8 it is computed from the rounded probabilities, so that
+            results over different key ranges can be merged consistently with the output.
     """
     _check_args(dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes)
     if layout not in ("bshd", "bhsd"):
@@ -117,7 +143,11 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, wi
 def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1),
                               softcap=0.0, alibi_slopes=None, deterministic=False, return_attn_probs=False, *,
                               return_lse=False, q_descale=None, k_descale=None, v_descale=None):
-    """qkv: (batch, seqlen, 3, nheads, d). Same as flash_attn_func on its three slices (they are copied)."""
+    """Attention over packed q, k, and v, the same as ``flash_attn_func`` on the three slices.
+
+    qkv: (batch, seqlen, 3, nheads, 128). The slices are copied before the kernel runs. The other arguments are those
+    of ``flash_attn_func``.
+    """
     q, k, v = qkv.unbind(2)
     return flash_attn_func(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes,
                            deterministic, return_attn_probs, return_lse=return_lse, q_descale=q_descale,
@@ -127,7 +157,11 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
 def flash_attn_kvpacked_func(q, kv, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1),
                              softcap=0.0, alibi_slopes=None, deterministic=False, return_attn_probs=False, *,
                              return_lse=False, q_descale=None, k_descale=None, v_descale=None):
-    """kv: (batch, seqlen, 2, nheads_k, d). Same as flash_attn_func on q and the two slices (they are copied)."""
+    """Attention over q and packed k and v, the same as ``flash_attn_func`` on q and the two slices.
+
+    q: (batch, seqlen, nheads, 128), kv: (batch, seqlen, 2, nheads_k, 128). The slices are copied before the kernel
+    runs. The other arguments are those of ``flash_attn_func``.
+    """
     k, v = kv.unbind(2)
     return flash_attn_func(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes,
                            deterministic, return_attn_probs, return_lse=return_lse, q_descale=q_descale,
@@ -138,9 +172,14 @@ def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, ma
                            softmax_scale=None, causal=False, window_size=(-1, -1), softcap=0.0, alibi_slopes=None,
                            deterministic=False, return_attn_probs=False, block_table=None, *, return_lse=False,
                            q_descale=None, k_descale=None, v_descale=None):
-    """Equal-length sequences only. q: (total, nheads, d_qk), k: (total, nheads_k, d_qk), v: (total, nheads_k, d_v).
-    The lengths are checked from the shapes (total == batch * max_seqlen), so cu_seqlens is never read back.
-    Returns out (total, nheads, d_v) and, when asked, lse (nheads, total)."""
+    """``flash_attn.flash_attn_varlen_func`` for batches of sequences of equal length.
+
+    q: (total, nheads, d_qk), k: (total, nheads_k, d_qk), v: (total, nheads_k, d_v), with total = batch * max_seqlen
+    and max_seqlen_q == max_seqlen_k. The lengths are checked from the shapes, so cu_seqlens is never read back to the
+    host. block_table (a paged KV cache) is not supported. The other arguments are those of ``flash_attn_func``.
+
+    Returns out (total, nheads, d_v) and, if requested, lse (nheads, total).
+    """
     if block_table is not None:
         raise NotImplementedError("zyfa has no paged KV cache")
     b = cu_seqlens_q.shape[0] - 1
@@ -159,8 +198,13 @@ def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, ma
 
 
 def fp8_quantize(x):
-    """Per-tensor power-of-two scaling to float8_e4m3fn, on the GPU (no host sync).
-    Returns (x_fp8, descale) with descale a 0-d float32 tensor and x ~= x_fp8 * descale."""
+    """Quantizes x to float8_e4m3fn with one power-of-two scale, on the GPU and without a host sync.
+
+    Returns (x_fp8, descale), where descale is a 0-d float32 tensor and x is approximately x_fp8 * descale. The descale
+    is the smallest power of two that brings the largest absolute value of x within the e4m3 range (at most 448), and
+    it is 1 if that value is zero or not finite. A power of two changes only the exponent, so scaling adds no rounding
+    error of its own.
+    """
     amax = x.abs().amax().float()
     ok = (amax > 0) & torch.isfinite(amax)
     descale = torch.where(ok, torch.exp2(torch.ceil(torch.log2(amax / 448.0))), torch.ones_like(amax))
