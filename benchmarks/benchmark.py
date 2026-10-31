@@ -1,10 +1,14 @@
-"""Causal attention forward TF/s: ZYFA vs AITER (if installed), and PyTorch SDPA with --sdpa.
+"""Causal attention forward throughput in TFLOP/s for ZYFA, AITER (if installed), and PyTorch SDPA (with --sdpa).
 
-python benchmarks/benchmark.py --dtype fp8 --dims 128 --seqlens 2048 16384 32768
-Same protocol as the README table: heads = max(32, 262144 / seqlen) at batch 1 (GQA with --group), q, k, v ~
-N(0, 0.1^2), kernel time = the GPU time of every kernel a call launches (torch.profiler), mean of 100 calls after 500
-warm-up calls, 5 s idle before each seqlen >= 16K. FLOPs = B * H * S^2 * (d_qk + d_v). FP8 calls pass all three
-descales as GPU tensors.
+    python benchmarks/benchmark.py --dtype fp8 --dims 128 --seqlens 2048 16384 32768
+
+The protocol follows the kernel benchmarks in the README. Each call has max(32, 262144 / seqlen) query heads at batch 1
+(GQA with --group) and q, k, and v drawn from N(0, 0.1^2). The time of a call is the GPU time of every kernel it
+launches, measured with torch.profiler, as the mean of 100 calls after 500 warm-up calls, with 5 s of idle time before
+each seqlen >= 16K. FLOPs = B * H * S^2 * (d_qk + d_v). FP8 calls pass all three descales as GPU tensors.
+
+Gaussian inputs make attention nearly uniform, and on activations captured from real models at sustained clocks the
+FP8 gain over AITER is smaller (see the README).
 """
 import argparse
 import os
