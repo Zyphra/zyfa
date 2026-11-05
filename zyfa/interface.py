@@ -14,9 +14,9 @@ try:
     from . import _C
 except ImportError as e:
     if glob.glob(os.path.join(os.path.dirname(__file__), "_C*.so")):
-        raise ImportError(f"zyfa's extension failed to load ({e}); rebuild it against this PyTorch with "
+        raise ImportError(f"zyfa's extension failed to load ({e}). Rebuild it against this PyTorch with "
                           "`pip install . --no-build-isolation`") from e
-    raise ImportError("zyfa's extension is not built: run `pip install . --no-build-isolation`, and import zyfa from "
+    raise ImportError("zyfa's extension is not built. Run `pip install . --no-build-isolation`, and import zyfa from "
                       "outside the source tree") from e
 
 FP8 = torch.float8_e4m3fn
@@ -50,7 +50,7 @@ def _(q, k, v, scale, v_scale, return_lse, bshd, q_descale, k_descale, v_descale
 
 @torch.library.custom_op("zyfa::no_backward", mutates_args=())
 def _no_backward(grad: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
-    raise NotImplementedError("zyfa is forward only: it has no backward pass")
+    raise NotImplementedError("zyfa is forward only and has no backward pass")
 
 
 @_no_backward.register_fake
@@ -213,12 +213,12 @@ def fp8_quantize(x):
 
 def _check_args(dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes):
     if dropout_p is None or isinstance(softmax_scale, bool):
-        raise TypeError("these arguments look like flash-attn 3's order (q, k, v, softmax_scale, causal); zyfa uses "
-                        "flash-attn 2's (q, k, v, dropout_p, softmax_scale, causal): pass them by keyword")
+        raise TypeError("these arguments look like flash-attn 3's order (q, k, v, softmax_scale, causal), but zyfa "
+                        "uses flash-attn 2's (q, k, v, dropout_p, softmax_scale, causal), so pass them by keyword")
     if dropout_p:
-        raise NotImplementedError("zyfa has no dropout (if this is softmax_scale, pass it by keyword)")
+        raise NotImplementedError("zyfa has no dropout (if this value is softmax_scale, pass it by keyword)")
     if not causal:
-        raise NotImplementedError("zyfa is causal only, pass causal=True")
+        raise NotImplementedError("zyfa is causal only, so pass causal=True")
     left, right = (-1 if w is None else w for w in window_size)
     if left >= 0 or right not in (-1, 0):
         raise NotImplementedError("zyfa has no sliding window")
@@ -238,7 +238,7 @@ def _check(q, k, v, bshd):
     if q.dtype not in (torch.bfloat16, FP8):
         raise TypeError(f"zyfa takes bfloat16 or float8_e4m3fn, got {q.dtype}")
     if (q.dtype, q.shape[-1], v.shape[-1]) not in _KERNELS:
-        raise ValueError(f"no kernel for {q.dtype} with (d_qk, d_v) = ({q.shape[-1]}, {v.shape[-1]}); supported: "
+        raise ValueError(f"no kernel for {q.dtype} with (d_qk, d_v) = ({q.shape[-1]}, {v.shape[-1]}). The kernels take "
                          "bfloat16 or float8_e4m3fn with (128, 128) or (192, 128)")
     if k.shape[-1] != q.shape[-1]:
         raise ValueError(f"q and k head dims differ: {q.shape[-1]} and {k.shape[-1]}")
@@ -249,14 +249,15 @@ def _check(q, k, v, bshd):
         raise NotImplementedError(f"zyfa needs seqlen_q == seqlen_k == seqlen_v, got {q.shape[s]}, {k.shape[s]}, "
                                   f"{v.shape[s]}")
     if k.shape[h] == 0 or k.shape[h] != v.shape[h] or q.shape[h] % k.shape[h]:
-        raise ValueError(f"nheads ({q.shape[h]}) must be a multiple of nheads_k ({k.shape[h]}), the same for k and v")
+        raise ValueError(f"nheads ({q.shape[h]}) must be a multiple of nheads_k ({k.shape[h]}), and k and v must "
+                         "have the same number of heads")
 
 
 def _check_arch(device):
     if device not in _ARCH_OK:
         arch = torch.cuda.get_device_properties(device).gcnArchName
         if not arch.startswith("gfx950"):
-            raise RuntimeError(f"zyfa's kernels are built for gfx950 (MI355X), this GPU is {arch}")
+            raise RuntimeError(f"zyfa's kernels are built for gfx950 (MI355X), but this GPU is {arch}")
         _ARCH_OK.add(device)
 
 
@@ -270,8 +271,8 @@ def _descale(x, name, q, hk):
         expanded = x.dim() == 2 and tuple(x.shape) == (q.shape[0], hk) and all(
             st == 0 for n, st in zip(x.shape, x.stride()) if n > 1)
         if x.numel() != 1 and not expanded:
-            raise NotImplementedError(f"zyfa takes one {name} per tensor: pass a 1-element tensor, or one expanded to "
-                                      "(batch, nheads_k) with .expand()")
+            raise NotImplementedError(f"zyfa takes one {name} per tensor, so pass a 1-element tensor or a 1-element "
+                                      "tensor expanded to (batch, nheads_k) with .expand()")
         return 1.0, x
     x = float(x)
     if not 1.1754943508222875e-38 <= x <= 3.4028234663852886e38:

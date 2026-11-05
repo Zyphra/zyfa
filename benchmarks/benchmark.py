@@ -3,9 +3,10 @@
     python benchmarks/benchmark.py --dtype fp8 --dims 128 --seqlens 2048 16384 32768
 
 The protocol follows the kernel benchmarks in the README. Each call has max(32, 262144 / seqlen) query heads at batch 1
-(GQA with --group) and q, k, and v drawn from N(0, 0.1^2). The time of a call is the GPU time of every kernel it
-launches, measured with torch.profiler, as the mean of 100 calls after 500 warm-up calls, with 5 s of idle time before
-each seqlen >= 16K. FLOPs = B * H * S^2 * (d_qk + d_v). FP8 calls pass all three descales as GPU tensors.
+(GQA with --group) and q, k, and v drawn from N(0, 0.1^2). The time of a call is kernel-only, the GPU time of every
+kernel that the call launches, measured with torch.profiler as the mean of 100 calls after 500 warm-up calls, with 5 s
+of idle time before each seqlen >= 16K. FLOPs = B * H * S^2 * (d_qk + d_v). FP8 calls pass all three descales as GPU
+tensors.
 
 Gaussian inputs make attention nearly uniform, and on activations captured from real models at sustained clocks the
 FP8 gain over AITER is smaller (see the README).
@@ -45,7 +46,7 @@ def kernel_time(fn, warmup, iters):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dtype", choices=["bf16", "fp8"], default="bf16")
-    p.add_argument("--dims", type=int, choices=[128, 192], default=128, help="d_qk; d_v is 128")
+    p.add_argument("--dims", type=int, choices=[128, 192], default=128, help="d_qk (d_v is always 128)")
     p.add_argument("--seqlens", type=int, nargs="+", default=[1024, 2048, 4096, 8192, 16384, 32768])
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--heads", type=int, default=0, help="query heads, 0 = max(32, 262144 / seqlen)")

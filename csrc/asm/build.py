@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Generates the FP8 attention kernels (d128.py, d192.py), assembles them for gfx950 with ROCm clang and ld.lld, and
-writes C headers embedding the code objects, which the launchers load with hipModuleLoadData.
+"""Builds the FP8 attention kernels for gfx950 and embeds their code objects in C headers.
+
+Generates the assembly of each kernel (d128.py, d192.py), assembles it with ROCm clang and ld.lld, and writes a C
+header that embeds the code object, which the launchers load with hipModuleLoadData.
 
 Usage: python build.py --out-dir DIR [--rocm PATH]"""
 import argparse

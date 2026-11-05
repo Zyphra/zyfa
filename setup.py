@@ -10,8 +10,8 @@ try:
     import torch
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 except ImportError:
-    sys.exit("zyfa builds against the PyTorch already installed: install a ROCm build of PyTorch, then run "
-             "`pip install . --no-build-isolation`")
+    sys.exit("zyfa builds against the PyTorch that is already installed, so install a ROCm build of PyTorch first "
+             "and then run `pip install . --no-build-isolation`")
 
 ROOT = Path(__file__).resolve().parent
 VERSION = re.search(r'__version__ = "(.+)"', (ROOT / "zyfa" / "__init__.py").read_text()).group(1)
@@ -40,7 +40,7 @@ setup(
     name="zyfa",
     version=VERSION,
     author="Zyphra",
-    description="Flash attention for AMD MI355X, from the Zyphra Optimization Engine (ZOE)",
+    description="FlashAttention kernels for the AMD Instinct MI355X, from the Zyphra Optimization Engine (ZOE)",
     long_description=(ROOT / "README.md").read_text(),
     long_description_content_type="text/markdown",
     url="https://github.com/Zyphra/zyfa",
