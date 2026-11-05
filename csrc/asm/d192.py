@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Generates the FP8 causal forward attention kernel for MLA shapes, d_qk = 192 and d_v = 128, on gfx950
-(`fmha_fp8pp192`) as hand-scheduled assembly. Same ping-pong structure as d128.py with 64-key tiles, K rows padded to
-256 B in LDS, and P = exp2 via v_exp_f32 with RNE conversion to e4m3."""
+(`fmha_fp8pp192`) as hand-scheduled assembly. The kernel has the ping-pong schedule of d128.py with 64-key tiles and
+K rows padded to 256 B in LDS. It computes exact P, which evaluates 2^x with v_exp_f32 and converts the result to e4m3
+with round-to-nearest-even."""
 from common import S_VD, KernelBase, LdsQ, kernel_text, main, rescale_vote, s, ss, v, vv
 
 # ---------------------------------------------------------------- registers
