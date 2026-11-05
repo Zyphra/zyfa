@@ -76,14 +76,13 @@ out = flash_attn_func(q8, k8, v8, causal=True, q_descale=q_s, k_descale=k_s, v_d
 | | |
 |---|---|
 | GPU | MI355X (gfx950) |
-| Pass | forward only |
-| Mask | causal, with seqlen_q = seqlen_k |
+| Attention | causal forward pass, with seqlen_q = seqlen_k |
 | Head dimensions (d_qk of q and k, d_v of v) | d_qk = d_v = 128, or d_qk = 192 with d_v = 128 (the per-head form of multi-head latent attention that prefill uses) |
-| Heads | MHA, GQA, and MQA |
+| Heads | multi-head (MHA), grouped-query (GQA), and multi-query (MQA) attention, with nheads a multiple of nheads_k |
+| Layouts | (batch, seqlen, heads, head_dim), or (batch, heads, seqlen, head_dim) with `layout="bhsd"` |
 | Inputs | BF16, or FP8 e4m3 (`torch.float8_e4m3fn`, with 4 exponent and 3 mantissa bits) with one descale per tensor |
 | Outputs | BF16 output and, on request, the FP32 log-sum-exp |
 | Batches | sequences of equal length |
-| Determinism | bitwise identical outputs from run to run |
 
 Not supported are decoding and KV caches, paged KV, batches of sequences with unequal lengths, non-causal masks and
 sliding windows, dropout, softcap, ALiBi, FP16 inputs, per-head FP8 descales, and the backward pass.
@@ -159,10 +158,12 @@ instruction to the next. Horace He showed the same effect for matrix multiplicat
 where inputs whose bits change less draw less power and therefore run at a higher clock
 ([Strangely, Matrix Multiplications on GPUs Run Faster When Given "Predictable" Data!](https://www.thonking.ai/p/strangely-matrix-multiplications)).
 Gaussian inputs with standard deviation 0.1 make attention nearly uniform,
-so every probability is close to the row maximum and every kernel writes normal FP8 values. In real activations most
+so every probability is close to the row maximum and every kernel writes normal FP8 values, which are at least 2^-6
+and keep all 3 mantissa bits. In real activations most
 probabilities lie far below the row maximum. In Mistral-7B layer 20, for 91% of the pairs of a row and a 64-key
-block, the largest probability of the block lies more than 8 binades (a factor of 256) below the row maximum. AITER's
-assembly kernel, which does not scale these blocks up, writes subnormal values or zeros there. Subnormal values and
+block, the largest probability of the block lies more than 8 binades (factors of two) below the row maximum. AITER's
+assembly kernel, which does not scale these blocks up, writes subnormal values (below 2^-6, with fewer mantissa bits)
+or zeros there. Subnormal values and
 zeros switch few bits in the matrix products, which is one reason why the clock of AITER's assembly kernel rises on the
 Mistral-7B and Qwen3-8B layers. ZYFA multiplies each 64-key block of probabilities by a power of two before rounding
 (per-block scaling), which keeps the same values normal and accurate but costs clock speed. ZYFA still needs fewer
@@ -183,7 +184,8 @@ are averaged over all layers of each model at S = 4K on WikiText-2.
 | DeepSeek-V2-Lite | 8.36e-3 | 1.02e-2 (Composable Kernel) | 1.94e-3 | 1.94e-3 |
 
 On Mistral-7B and Qwen3-8B, ZYFA's FP8 error is 62–78% lower than that of AITER's assembly kernel and within a few
-percent of that of Composable Kernel and Triton. AITER's assembly kernel divides each output by the sum of the
+percent of that of Composable Kernel and Triton. These percentages average the ratio of the two errors in each layer,
+so they differ slightly from the ratio of the averages in the table. AITER's assembly kernel divides each output by the sum of the
 unrounded probabilities, so probabilities that underflow to zero in the numerator still count in the denominator, and
 every output row shrinks slightly. ZYFA divides by the sum of the same rounded probabilities that multiply V, so each
 output remains a weighted average whose weights sum to one.
@@ -249,25 +251,27 @@ The paper describes each part in detail. The main ideas are the following.
   value doubles, so the code is close to 8·log2 of the value plus a constant. The kernel therefore writes the FP8 code
   of each probability p = 2^x (x is the score minus the row maximum in base-2 units) directly with one multiply-add
   and one integer conversion, instead of an exponential and an FP8 conversion. For 32 queries against a
-  128-key block, lean P lowers the vector-pipe cycles of the softmax from 896 to 384, against 1024 cycles of matrix
-  work. At d_qk = 192 the kernel uses exact P, because lean P falls below the signal-to-noise threshold of our
-  correctness test in 1 of 24 configurations there.
+  128-key block, lean P lowers the softmax cycles on the vector pipe (the unit that runs elementwise arithmetic) from
+  896 to 384, against 1024 cycles on the matrix pipe (the unit that runs matrix instructions). At d_qk = 192 the kernel
+  uses exact P, because there lean P falls below the signal-to-noise threshold of our correctness test in 1 of 24
+  configurations, although it matches exact P end to end on DeepSeek-V2-Lite.
 - **Per-block scaling.** Most probabilities in a long row lie many binades below the row maximum, where e4m3 values
-  become subnormal (below 2^-6) or zero (below 2^-10). The FP8 kernels multiply each 64-key block of probabilities by a
-  power of two so that the largest value of the block gets the code of 1, and the scaled FP8 matrix instruction of
-  CDNA4 removes the factor at no extra cost.
+  become subnormal (below 2^-6) or underflow to zero (below 2^-10). The FP8 kernels multiply each 64-key block of
+  probabilities by a power of two so that the largest value of the block gets the code that p = 1 would get, and the
+  scaled FP8 matrix instruction of CDNA4 divides the same power of two back out in the PV product at no extra cost.
 - **Row sum on the matrix unit.** One extra matrix instruction (MFMA, matrix fused multiply-add) per 64-key block
   multiplies the FP8 probabilities by a vector of ones, so the denominator is the sum of the same rounded values as the
-  numerator. The extra MFMA adds 6% to the matrix work and removes vector additions from the vector unit, which is the
+  numerator. The extra MFMA adds 6% to the matrix work and removes vector additions from the vector pipe, which is the
   bottleneck of FP8 attention.
-- **Ping-pong schedule.** The FP8 kernels are generated as gfx950 assembly by the Python scripts in `csrc/asm`. The two
-  waves (groups of 64 threads that issue instructions together) that share each SIMD unit alternate between issuing
+- **Ping-pong schedule.** The FP8 kernels are generated as gfx950 assembly by the Python scripts in `csrc/asm`. Each
+  compute unit (CU) has four SIMDs, the units that issue the instructions of their waves (groups of 64 threads that
+  issue instructions together). The two waves that share each SIMD alternate between issuing
   the matrix instructions and computing the softmax, so the matrix pipe and the vector pipe work at the same time. The
   MI355X does not track the completion of matrix instructions in hardware, so this overlap depends entirely on the
   order of the instructions. With lean P the matrix pipe is busy for 86% of the cycles in the steady state of the key
   loop.
 - **Work distribution.** Causal query tiles are paired first with last, so every job (one pair of tiles) does the same
-  amount of work. A persistent grid of one workgroup per compute unit (CU) runs the jobs, and each workgroup loops over
+  amount of work. A persistent grid of one workgroup per CU runs the jobs, and each workgroup loops over
   many jobs instead of exiting after one. The grid is remapped so that each of the eight chiplets (XCDs) processes
   consecutive tile pairs of one head, which then share K and V in that chiplet's L2 cache.
 - **Lazy rescaling.** The output is rescaled only when the running maximum of a row grows by more than a threshold.
