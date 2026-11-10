@@ -51,8 +51,8 @@ setup(
     ext_modules=[
         CUDAExtension(
             name="zyfa._C",
-            sources=[f"csrc/{f}" for f in ("bindings.cpp", "bf16_d128.hip", "bf16_d192.hip", "fp8_d128.hip",
-                                           "fp8_d192.hip", "fp8_d128_asm.hip", "fp8_d192_asm.hip")],
+            sources=[f"csrc/{f}" for f in ("bindings.cpp", "bf16_d128.hip", "bf16_d192.hip", "fp8_d64.hip",
+                                           "fp8_d128.hip", "fp8_d192.hip", "fp8_d128_asm.hip", "fp8_d192_asm.hip")],
             include_dirs=[str(ROOT / "csrc"), str(GEN), str(ROOT / "third_party" / "hipkittens" / "include")],
             extra_compile_args={"cxx": ["-O3", "-std=c++20"], "nvcc": hip_flags},
         )

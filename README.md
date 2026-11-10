@@ -74,7 +74,7 @@ out = flash_attn_func(q8, k8, v8, causal=True, q_descale=q_s, k_descale=k_s, v_d
 | GPU | MI355X (gfx950) |
 | Pass | forward only |
 | Mask | causal, with seqlen_q = seqlen_k |
-| Head dimensions | d_qk = d_v = 128, or d_qk = 192 with d_v = 128 (the per-head form of MLA that prefill uses) |
+| Head dimensions | d_qk = d_v = 64 (FP8 only), d_qk = d_v = 128, or d_qk = 192 with d_v = 128 (the per-head form of MLA that prefill uses) |
 | Heads | MHA, GQA, and MQA |
 | Inputs | BF16, or FP8 e4m3 (`torch.float8_e4m3fn`) with one descale per tensor |
 | Outputs | BF16 output and, on request, the FP32 log-sum-exp |

@@ -21,7 +21,7 @@ except ImportError as e:
 
 FP8 = torch.float8_e4m3fn
 _KERNELS = {(torch.bfloat16, 128, 128): _C.bf16_d128, (torch.bfloat16, 192, 128): _C.bf16_d192,
-            (FP8, 128, 128): _C.fp8_d128, (FP8, 192, 128): _C.fp8_d192}
+            (FP8, 64, 64): _C.fp8_d64, (FP8, 128, 128): _C.fp8_d128, (FP8, 192, 128): _C.fp8_d192}
 _ARCH_OK = set()
 
 
@@ -79,9 +79,9 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, wi
     Args:
         q: (batch, seqlen, nheads, d_qk), or (batch, nheads, seqlen, d_qk) with ``layout="bhsd"``.
         k: (batch, seqlen, nheads_k, d_qk). nheads must be a multiple of nheads_k (MHA, GQA, or MQA).
-        v: (batch, seqlen, nheads_k, d_v). (d_qk, d_v) is (128, 128) or (192, 128), and q, k, and v are all
-            bfloat16 or all float8_e4m3fn. Any seqlen works, and lengths that are not a multiple of 256 are padded
-            with zeros, which copies q, k, and v.
+        v: (batch, seqlen, nheads_k, d_v). (d_qk, d_v) is (64, 64) for float8_e4m3fn, or (128, 128) or (192, 128)
+            for either dtype. q, k, and v are all bfloat16 or all float8_e4m3fn. Any seqlen works, and lengths that
+            are not a multiple of 256 are padded with zeros, which copies q, k, and v.
         dropout_p: must be 0.
         softmax_scale: scale applied to q k^T before the softmax. Defaults to 1 / sqrt(d_qk).
         causal: must be True.
@@ -239,7 +239,7 @@ def _check(q, k, v, bshd):
         raise TypeError(f"zyfa takes bfloat16 or float8_e4m3fn, got {q.dtype}")
     if (q.dtype, q.shape[-1], v.shape[-1]) not in _KERNELS:
         raise ValueError(f"no kernel for {q.dtype} with (d_qk, d_v) = ({q.shape[-1]}, {v.shape[-1]}); supported: "
-                         "bfloat16 or float8_e4m3fn with (128, 128) or (192, 128)")
+                         "bfloat16 with (128, 128) or (192, 128), or float8_e4m3fn with (64, 64), (128, 128), or (192, 128)")
     if k.shape[-1] != q.shape[-1]:
         raise ValueError(f"q and k head dims differ: {q.shape[-1]} and {k.shape[-1]}")
     s, h = (1, 2) if bshd else (2, 1)

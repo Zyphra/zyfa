@@ -8,6 +8,7 @@ from zyfa import (flash_attn_func, flash_attn_kvpacked_func, flash_attn_qkvpacke
 
 FP8 = torch.float8_e4m3fn
 DIMS = [(128, 128), (192, 128)]
+FP8_DIMS = [(64, 64), *DIMS]
 HEADS = [(8, 8), (8, 2), (8, 1)]
 SHAPES = [(1, 1024, False), (2, 512, False), (1, 8192, False), (1, 2048, True)]
 
@@ -80,7 +81,7 @@ def test_bf16(dims, heads, layout, b, s, grow):
     assert (lse.double() - ref_lse).abs().max().item() < 1e-4
 
 
-@pytest.mark.parametrize("dims", DIMS)
+@pytest.mark.parametrize("dims", FP8_DIMS)
 @pytest.mark.parametrize("heads", HEADS)
 @pytest.mark.parametrize("layout", ["bshd", "bhsd"])
 @pytest.mark.parametrize("b,s,grow", SHAPES)
@@ -90,7 +91,7 @@ def test_fp8(dims, heads, layout, b, s, grow):
     check_fp8(out, lse, q8, k8, v8, dq, dk, dv)
 
 
-@pytest.mark.parametrize("dims", DIMS)
+@pytest.mark.parametrize("dims", FP8_DIMS)
 @pytest.mark.parametrize("kind", ["float", "tensor", "expanded", "none"])
 def test_fp8_descale_kinds(dims, kind):
     b, hq, hkv, s = 2, 8, 2, 1024
@@ -109,7 +110,7 @@ def test_fp8_descale_kinds(dims, kind):
     check_fp8(out, lse, q8, k8, v8, dq, dk, dv)
 
 
-@pytest.mark.parametrize("dims", DIMS)
+@pytest.mark.parametrize("dims", FP8_DIMS)
 def test_fp8_unit_descales_are_exact(dims):
     q8, k8, v8 = (x.to(FP8) for x in inputs(1, 8, 2, 2048, *dims))
     one = torch.ones(1, device="cuda")
@@ -119,7 +120,7 @@ def test_fp8_unit_descales_are_exact(dims):
     assert torch.equal(bits(a), bits(b)) and torch.equal(bits(la), bits(lb))
 
 
-@pytest.mark.parametrize("dims", DIMS)
+@pytest.mark.parametrize("dims", FP8_DIMS)
 def test_fp8_cuda_graph_reads_descales_on_device(dims):
     q8, k8, v8 = (x.to(FP8) for x in inputs(1, 8, 2, 2048, *dims))
     dq, dk, dv = (torch.ones(1, device="cuda") for _ in range(3))
@@ -171,13 +172,13 @@ def test_fp8_empty_batch_with_descales():
 
 
 @pytest.mark.parametrize("dtype,dims", [(torch.bfloat16, (128, 128)), (torch.bfloat16, (192, 128)),
-                                        (FP8, (128, 128)), (FP8, (192, 128))])
+                                        (FP8, (64, 64)), (FP8, (128, 128)), (FP8, (192, 128))])
 @pytest.mark.parametrize("s", [1, 100, 300, 768, 1280])
 def test_any_seqlen(dtype, dims, s):
     q, k, v = (x.to(dtype) for x in inputs(2, 8, 2, s, *dims))
     out, lse = flash_attn_func(q, k, v, causal=True, layout="bhsd", return_lse=True)
     ref, ref_lse = reference(q, k, v, 1 / math.sqrt(dims[0]))
-    assert out.shape == (2, 8, s, 128) and lse.shape == (2, 8, s) and out.is_contiguous()
+    assert out.shape == (2, 8, s, dims[1]) and lse.shape == (2, 8, s) and out.is_contiguous()
     assert rel_rms(out, ref) < (5e-3 if dtype == torch.bfloat16 else 5e-2)
     assert (lse.double() - ref_lse).abs().max().item() < (1e-4 if dtype == torch.bfloat16 else 6e-2)
 
@@ -190,7 +191,7 @@ def test_seqlen_zero(dtype):
 
 
 @pytest.mark.parametrize("dtype,dims", [(torch.bfloat16, (128, 128)), (torch.bfloat16, (192, 128)),
-                                        (FP8, (128, 128)), (FP8, (192, 128))])
+                                        (FP8, (64, 64)), (FP8, (128, 128)), (FP8, (192, 128))])
 def test_deterministic(dtype, dims):
     q, k, v = (x.to(dtype) for x in inputs(1, 8, 2, 4096, *dims))
     a = flash_attn_func(q, k, v, causal=True, layout="bhsd")

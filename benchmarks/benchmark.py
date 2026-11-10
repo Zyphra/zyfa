@@ -12,6 +12,7 @@ FP8 gain over AITER is smaller (see the README).
 """
 import argparse
 import os
+import sys
 import time
 
 os.environ.setdefault("KINETO_LOG_LEVEL", "5")   # quiet torch.profiler
@@ -45,7 +46,8 @@ def kernel_time(fn, warmup, iters):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dtype", choices=["bf16", "fp8"], default="bf16")
-    p.add_argument("--dims", type=int, choices=[128, 192], default=128, help="d_qk; d_v is 128")
+    p.add_argument("--dims", type=int, choices=[64, 128, 192], default=128,
+                   help="d_qk; d_v is 64 when d_qk is 64 (FP8 only), otherwise 128")
     p.add_argument("--seqlens", type=int, nargs="+", default=[1024, 2048, 4096, 8192, 16384, 32768])
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--heads", type=int, default=0, help="query heads, 0 = max(32, 262144 / seqlen)")
@@ -59,7 +61,9 @@ def main():
         torch.ones(1, device="cuda").add_(1)
         torch.cuda.synchronize()
 
-    dqk, dv = a.dims, 128
+    if a.dims == 64 and a.dtype != "fp8":
+        sys.exit("d=64 is FP8 only")
+    dqk, dv = a.dims, 64 if a.dims == 64 else 128
     sdpa = a.sdpa and a.dtype == "bf16" and dqk == dv
     cols = ["zyfa", "aiter"] + (["sdpa"] if sdpa else [])
     print(f"{'seqlen':>7} {'heads':>6} " + " ".join(f"{c:>8}" for c in cols) + "  TF/s")
